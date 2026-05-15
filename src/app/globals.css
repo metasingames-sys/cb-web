@@ -1,0 +1,43 @@
+@import "tailwindcss";
+
+:root {
+  --color-curse: #8B0000;
+  --color-mana: #4169E1;
+  --color-crystal: #E0E0FF;
+  --color-matter: #8B4513;
+  --color-flesh: #DC143C;
+  --color-ally: #22C55E;
+  --color-enemy: #EF4444;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #1a1a2e;
+}
+::-webkit-scrollbar-thumb {
+  background: #4a4a6a;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #6a6a8a;
+}
+
+/* Game canvas container */
+.game-container canvas {
+  display: block;
+  image-rendering: pixelated;
+}
+
+/* Stat bar animations */
+@keyframes pulse-red {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
+.pulse-curse {
+  animation: pulse-red 2s ease-in-out infinite;
+}
