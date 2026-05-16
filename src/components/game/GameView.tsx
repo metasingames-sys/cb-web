@@ -94,6 +94,9 @@ function getPortraitPath(unitName: string): string {
 
 // ─── Fog of War Helpers ──────────────────────────────────────
 
+// Set of loop positions for quick lookup
+const LOOP_SET = new Set(LOOP_PATH.map(([x, y]) => `${x},${y}`));
+
 function computeVisibility(map: MapTile[][]): void {
   const size = map.length;
   // Reset all to foggy first (unless we keep discovered)
@@ -118,6 +121,13 @@ function computeVisibility(map: MapTile[][]): void {
       }
     }
   }
+
+  // Loop road tiles are ALWAYS fully active
+  LOOP_PATH.forEach(([lx, ly]) => {
+    if (map[ly][lx].tileName === "Road") {
+      map[ly][lx].visibility = TileVisibility.Active;
+    }
+  });
 }
 
 function illuminate(map: MapTile[][], cx: number, cy: number, radius: number): void {
@@ -173,12 +183,12 @@ function createInitialState(): GameState {
     }
   }
 
-  // Place road loop (Loop Hero-style circuit)
+  // Place road loop (Loop Hero-style circuit) — roads are always visible
   LOOP_PATH.forEach(([rx, ry]) => {
     map[ry][rx] = {
       tileTypeId: 4, tileName: "Road", x: rx, y: ry, units: [],
       visibility: TileVisibility.Active,
-      isLightSource: false, lightRadius: 0,
+      isLightSource: true, lightRadius: 1, // roads illuminate adjacent tiles
     };
   });
 
@@ -277,18 +287,22 @@ function drawGrid(
       }
 
       const isBlank = tile.tileName === "Blank";
+      const isOnLoop = LOOP_SET.has(`${x},${y}`);
       if (isBlank) {
-        // Discovered blank — dark ground, slightly lighter than fog
-        ctx.fillStyle = vis >= TileVisibility.Empty ? "#0e0e1a" : "#0a0a14";
+        // Discovered blank — dark ground with subtle grid
+        ctx.fillStyle = vis >= TileVisibility.Empty ? "#111118" : "#0a0a14";
         ctx.fillRect(px, py, TILE_SIZE, TILE_SIZE);
         if (vis >= TileVisibility.Discovered) {
-          ctx.strokeStyle = "rgba(40, 40, 60, 0.4)";
+          // Subtle placement indicator
+          ctx.strokeStyle = "rgba(50, 50, 70, 0.3)";
           ctx.lineWidth = 0.5;
-          ctx.strokeRect(px + 0.5, py + 0.5, TILE_SIZE - 1, TILE_SIZE - 1);
+          ctx.setLineDash([4, 4]);
+          ctx.strokeRect(px + 2, py + 2, TILE_SIZE - 4, TILE_SIZE - 4);
+          ctx.setLineDash([]);
         }
       } else {
-        // Non-blank tile — draw dark base behind sprite
-        ctx.fillStyle = "#0a0a14";
+        // Non-blank tile — draw dark earth base behind sprite
+        ctx.fillStyle = isOnLoop ? "#1a1610" : "#0c0c14";
         ctx.fillRect(px, py, TILE_SIZE, TILE_SIZE);
       }
     }
@@ -458,6 +472,19 @@ function drawGrid(
       }
     }
   }
+
+  // ─── Pass 3.5: Loop path trail indicator ───
+  ctx.strokeStyle = "rgba(120, 100, 60, 0.15)";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  LOOP_PATH.forEach(([lx, ly], i) => {
+    const lpx = CANVAS_PADDING + lx * totalSize + TILE_SIZE / 2;
+    const lpy = CANVAS_PADDING + ly * totalSize + TILE_SIZE / 2;
+    if (i === 0) ctx.moveTo(lpx, lpy);
+    else ctx.lineTo(lpx, lpy);
+  });
+  ctx.closePath();
+  ctx.stroke();
 
   // ─── Pass 4: Fog edge vignette ───
   // Darken edges where fog meets discovered tiles for atmosphere
