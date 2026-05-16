@@ -28,10 +28,26 @@ import type {
 
 const GRID_SIZE = 10;
 const TILE_SIZE = 64;
-const TILE_GAP = 2;
-const CANVAS_PADDING = 12;
-const CAMP_LIGHT_RADIUS = 2;
+const TILE_GAP = 0;
+const CANVAS_PADDING = 0;
+const CAMP_LIGHT_RADIUS = 3;
 const TORCH_LIGHT_RADIUS = 2;
+const SPRITE_SCALE = 1.15; // sprites render 15% larger for alpha overlap
+
+// Loop Hero-style road circuit (clockwise from top-left)
+const LOOP_PATH: [number, number][] = [
+  // Top row (left to right)
+  [2,2], [3,2], [4,2], [5,2], [6,2], [7,2],
+  // Right column (top to bottom)
+  [7,3], [7,4], [7,5], [7,6],
+  // Bottom row (right to left)
+  [7,7], [6,7], [5,7], [4,7], [3,7], [2,7],
+  // Left column (bottom to top)
+  [2,6], [2,5], [2,4], [2,3],
+];
+
+// Track sprite dimensions for overflow rendering
+const spriteDimensions: Record<string, { w: number; h: number }> = {};
 
 const PLACEABLE_TILES = [
   "Meadow", "Hill", "Copse", "Spring", "Forest", "Field",
@@ -57,7 +73,11 @@ function getImage(src: string): HTMLImageElement | null {
   const img = new Image();
   img.crossOrigin = "anonymous";
   img.src = src;
-  img.onload = () => { imageCache[src] = img; imageLoading.delete(src); };
+  img.onload = () => {
+    imageCache[src] = img;
+    imageLoading.delete(src);
+    spriteDimensions[src] = { w: img.naturalWidth, h: img.naturalHeight };
+  };
   img.onerror = () => { imageLoading.delete(src); imageFailed.add(src); };
   return null;
 }
@@ -152,18 +172,9 @@ function createInitialState(): GameState {
       };
     }
   }
-  const mid = Math.floor(GRID_SIZE / 2);
 
-  // Place camp (light source)
-  map[mid][mid] = {
-    tileTypeId: 3, tileName: "Camp", x: mid, y: mid, units: [],
-    visibility: TileVisibility.Active,
-    isLightSource: true, lightRadius: CAMP_LIGHT_RADIUS,
-  };
-
-  // Roads around camp
-  const roadPositions = [[mid, mid - 1], [mid, mid + 1], [mid - 1, mid], [mid + 1, mid]];
-  roadPositions.forEach(([ry, rx]) => {
+  // Place road loop (Loop Hero-style circuit)
+  LOOP_PATH.forEach(([rx, ry]) => {
     map[ry][rx] = {
       tileTypeId: 4, tileName: "Road", x: rx, y: ry, units: [],
       visibility: TileVisibility.Active,
@@ -171,11 +182,24 @@ function createInitialState(): GameState {
     };
   });
 
+  // Place camp at center of loop (5,5)
+  const campX = 5, campY = 5;
+  map[campY][campX] = {
+    tileTypeId: 3, tileName: "Camp", x: campX, y: campY, units: [],
+    visibility: TileVisibility.Active,
+    isLightSource: true, lightRadius: CAMP_LIGHT_RADIUS,
+  };
+
   // Place warrior at camp
   const warrior = unitTypes.find((u) => u.name === "Warrior")!;
-  map[mid][mid].units.push(createUnitInstance(warrior, false));
+  map[campY][campX].units.push(createUnitInstance(warrior, false));
 
-  // Compute initial fog
+  // Compute initial fog — camp light reveals the loop and nearby tiles
+  computeVisibility(map);
+  // Also discover all tiles adjacent to the loop
+  LOOP_PATH.forEach(([rx, ry]) => {
+    discoverAround(map, rx, ry, 1);
+  });
   computeVisibility(map);
 
   return {
@@ -216,102 +240,142 @@ function drawGrid(
   selectedTile: { x: number; y: number } | null,
   dragTile: string | null,
   placingTorch: boolean,
+  partyPos: number,
 ) {
   const { map } = state;
   const totalSize = TILE_SIZE + TILE_GAP;
-  ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
-  ctx.fillStyle = "#060610";
-  ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+  const cw = ctx.canvas.width;
+  const ch = ctx.canvas.height;
+  ctx.clearRect(0, 0, cw, ch);
 
+  // ─── Dark atmospheric background ───
+  ctx.fillStyle = "#060610";
+  ctx.fillRect(0, 0, cw, ch);
+
+  // ─── Pass 1: Background layer (fog, blanks, base colors) ───
   for (let y = 0; y < GRID_SIZE; y++) {
     for (let x = 0; x < GRID_SIZE; x++) {
       const tile = map[y][x];
       const px = CANVAS_PADDING + x * totalSize;
       const py = CANVAS_PADDING + y * totalSize;
-      const isHovered = hoveredTile?.x === x && hoveredTile?.y === y;
-      const isSelected = selectedTile?.x === x && selectedTile?.y === y;
       const vis = tile.visibility;
 
-      // ─── Foggy tiles ───
       if (vis === TileVisibility.Foggy) {
-        ctx.fillStyle = "#0a0a14";
+        // Dark atmospheric fog — no purple dots, just subtle dark variation
+        const seed = (x * 7 + y * 13) % 17;
+        const r = 6 + (seed % 4);
+        const g = 6 + (seed % 3);
+        const b = 14 + (seed % 6);
+        ctx.fillStyle = `rgb(${r},${g},${b})`;
+        ctx.fillRect(px, py, TILE_SIZE, TILE_SIZE);
+        // Subtle fog wisps
+        ctx.fillStyle = `rgba(20, 15, 35, ${0.3 + (seed % 5) * 0.08})`;
         ctx.beginPath();
-        ctx.roundRect(px, py, TILE_SIZE, TILE_SIZE, 3);
+        ctx.arc(px + TILE_SIZE * 0.3 + seed * 2, py + TILE_SIZE * 0.5, TILE_SIZE * 0.25, 0, Math.PI * 2);
         ctx.fill();
-        // Fog pattern
-        ctx.fillStyle = "rgba(30, 20, 50, 0.6)";
-        for (let i = 0; i < 3; i++) {
-          const fx = px + 8 + (i * 18) + Math.sin(y * 3 + i) * 4;
-          const fy = py + 20 + Math.cos(x * 2 + i) * 8;
-          ctx.beginPath();
-          ctx.arc(fx, fy, 10, 0, Math.PI * 2);
-          ctx.fill();
-        }
         continue;
       }
 
-      // ─── Discovered but dim ───
+      const isBlank = tile.tileName === "Blank";
+      if (isBlank) {
+        // Discovered blank — dark ground, slightly lighter than fog
+        ctx.fillStyle = vis >= TileVisibility.Empty ? "#0e0e1a" : "#0a0a14";
+        ctx.fillRect(px, py, TILE_SIZE, TILE_SIZE);
+        if (vis >= TileVisibility.Discovered) {
+          ctx.strokeStyle = "rgba(40, 40, 60, 0.4)";
+          ctx.lineWidth = 0.5;
+          ctx.strokeRect(px + 0.5, py + 0.5, TILE_SIZE - 1, TILE_SIZE - 1);
+        }
+      } else {
+        // Non-blank tile — draw dark base behind sprite
+        ctx.fillStyle = "#0a0a14";
+        ctx.fillRect(px, py, TILE_SIZE, TILE_SIZE);
+      }
+    }
+  }
+
+  // ─── Pass 2: Tile sprites (top to bottom for correct overlap) ───
+  for (let y = 0; y < GRID_SIZE; y++) {
+    for (let x = 0; x < GRID_SIZE; x++) {
+      const tile = map[y][x];
+      const px = CANVAS_PADDING + x * totalSize;
+      const py = CANVAS_PADDING + y * totalSize;
+      const vis = tile.visibility;
+      if (vis === TileVisibility.Foggy) continue;
       const isDim = vis === TileVisibility.Discovered || vis === TileVisibility.Filled;
       const isBlank = tile.tileName === "Blank";
 
       if (!isBlank) {
-        const img = getImage(getTileImagePath(tile.tileName));
+        const imgPath = getTileImagePath(tile.tileName);
+        const img = getImage(imgPath);
         if (img) {
-          if (isDim) ctx.globalAlpha = 0.45;
-          ctx.drawImage(img, px, py, TILE_SIZE, TILE_SIZE);
+          const dims = spriteDimensions[imgPath];
+          if (isDim) ctx.globalAlpha = 0.5;
+          if (dims && (dims.w > 260 || dims.h > 260)) {
+            // Oversized sprite — render with overflow, bottom-aligned
+            const baseW = TILE_SIZE * SPRITE_SCALE;
+            const aspect = dims.h / dims.w;
+            const drawW = baseW;
+            const drawH = baseW * aspect;
+            const drawX = px + (TILE_SIZE - drawW) / 2;
+            const drawY = py + TILE_SIZE - drawH; // bottom-aligned
+            ctx.drawImage(img, drawX, drawY, drawW, drawH);
+          } else {
+            // Standard 256×256 tile — slight overflow for alpha blending
+            const overflow = TILE_SIZE * (SPRITE_SCALE - 1);
+            ctx.drawImage(
+              img,
+              px - overflow / 2,
+              py - overflow / 2,
+              TILE_SIZE + overflow,
+              TILE_SIZE + overflow,
+            );
+          }
           ctx.globalAlpha = 1;
         } else {
+          // Fallback color while loading
           ctx.fillStyle = tileColors[tile.tileName] || "#1a1a2e";
-          if (isDim) ctx.globalAlpha = 0.45;
-          ctx.beginPath();
-          ctx.roundRect(px, py, TILE_SIZE, TILE_SIZE, 3);
-          ctx.fill();
+          if (isDim) ctx.globalAlpha = 0.5;
+          ctx.fillRect(px + 2, py + 2, TILE_SIZE - 4, TILE_SIZE - 4);
           ctx.globalAlpha = 1;
         }
-      } else {
-        // Empty/Discovered blank
-        ctx.fillStyle = vis >= TileVisibility.Empty ? "#0d0d1c" : "#090914";
-        ctx.beginPath();
-        ctx.roundRect(px, py, TILE_SIZE, TILE_SIZE, 3);
-        ctx.fill();
-        if (vis >= TileVisibility.Empty) {
-          ctx.strokeStyle = "#1e1e30";
-          ctx.lineWidth = 1;
-          ctx.setLineDash([3, 3]);
-          ctx.beginPath();
-          ctx.roundRect(px + 1, py + 1, TILE_SIZE - 2, TILE_SIZE - 2, 2);
-          ctx.stroke();
-          ctx.setLineDash([]);
-        }
       }
+    }
+  }
 
-      // Light source glow
+  // ─── Pass 3: Overlays (selection, hover, light, units, party marker) ───
+  for (let y = 0; y < GRID_SIZE; y++) {
+    for (let x = 0; x < GRID_SIZE; x++) {
+      const tile = map[y][x];
+      const px = CANVAS_PADDING + x * totalSize;
+      const py = CANVAS_PADDING + y * totalSize;
+      const vis = tile.visibility;
+      if (vis === TileVisibility.Foggy) continue;
+      const isHovered = hoveredTile?.x === x && hoveredTile?.y === y;
+      const isSelected = selectedTile?.x === x && selectedTile?.y === y;
+      const isBlank = tile.tileName === "Blank";
+
+      // Light source warm glow
       if (tile.isLightSource) {
         const gradient = ctx.createRadialGradient(
-          px + TILE_SIZE / 2, py + TILE_SIZE / 2, 4,
-          px + TILE_SIZE / 2, py + TILE_SIZE / 2, TILE_SIZE * 0.7,
+          px + TILE_SIZE / 2, py + TILE_SIZE / 2, 2,
+          px + TILE_SIZE / 2, py + TILE_SIZE / 2, TILE_SIZE * 0.8,
         );
-        gradient.addColorStop(0, "rgba(255, 200, 60, 0.15)");
+        gradient.addColorStop(0, "rgba(255, 200, 60, 0.12)");
         gradient.addColorStop(1, "rgba(255, 200, 60, 0)");
         ctx.fillStyle = gradient;
-        ctx.fillRect(px, py, TILE_SIZE, TILE_SIZE);
+        ctx.fillRect(px - 4, py - 4, TILE_SIZE + 8, TILE_SIZE + 8);
       }
 
       // Hover highlight
       if (isHovered) {
         const canPlace = isBlank && vis >= TileVisibility.Discovered && (dragTile || placingTorch);
         if (canPlace) {
-          ctx.fillStyle = placingTorch
-            ? "rgba(255, 200, 60, 0.12)"
-            : "rgba(255, 255, 255, 0.08)";
-          ctx.beginPath();
-          ctx.roundRect(px, py, TILE_SIZE, TILE_SIZE, 3);
-          ctx.fill();
-          ctx.strokeStyle = placingTorch ? "rgba(255, 200, 60, 0.6)" : "rgba(251, 191, 36, 0.5)";
+          ctx.fillStyle = placingTorch ? "rgba(255, 200, 60, 0.15)" : "rgba(255, 255, 255, 0.1)";
+          ctx.fillRect(px, py, TILE_SIZE, TILE_SIZE);
+          ctx.strokeStyle = placingTorch ? "rgba(255, 200, 60, 0.7)" : "rgba(251, 191, 36, 0.6)";
           ctx.lineWidth = 2;
-          ctx.beginPath();
-          ctx.roundRect(px + 1, py + 1, TILE_SIZE - 2, TILE_SIZE - 2, 2);
-          ctx.stroke();
+          ctx.strokeRect(px + 1, py + 1, TILE_SIZE - 2, TILE_SIZE - 2);
         }
       }
 
@@ -320,31 +384,19 @@ function drawGrid(
         ctx.strokeStyle = "#fbbf24";
         ctx.lineWidth = 2;
         ctx.shadowColor = "#fbbf24";
-        ctx.shadowBlur = 6;
-        ctx.beginPath();
-        ctx.roundRect(px, py, TILE_SIZE, TILE_SIZE, 3);
-        ctx.stroke();
+        ctx.shadowBlur = 8;
+        ctx.strokeRect(px, py, TILE_SIZE, TILE_SIZE);
         ctx.shadowBlur = 0;
       }
 
-      // Tile name label
-      if (!isBlank && vis >= TileVisibility.Discovered) {
-        ctx.fillStyle = "rgba(0,0,0,0.6)";
-        ctx.fillRect(px, py + TILE_SIZE - 14, TILE_SIZE, 14);
-        ctx.fillStyle = isDim ? "#888" : "#fff";
-        ctx.font = "bold 8px system-ui, sans-serif";
-        ctx.textAlign = "center";
-        ctx.fillText(tile.tileName, px + TILE_SIZE / 2, py + TILE_SIZE - 3, TILE_SIZE - 4);
-      }
-
-      // Unit sprites
+      // Unit sprites on tiles
       if (tile.units.length > 0 && vis >= TileVisibility.Discovered) {
         const maxShow = Math.min(tile.units.length, 3);
-        const spriteSize = 22;
+        const spriteSize = 24;
         const startX = px + (TILE_SIZE - maxShow * (spriteSize + 2)) / 2;
         tile.units.slice(0, maxShow).forEach((unit, i) => {
           const ux = startX + i * (spriteSize + 2);
-          const uy = py + 2;
+          const uy = py + TILE_SIZE - spriteSize - 6;
           const unitImg = getImage(getUnitImagePath(unit.name));
           if (unitImg) {
             ctx.drawImage(unitImg, ux, uy, spriteSize, spriteSize);
@@ -354,28 +406,66 @@ function drawGrid(
             ctx.arc(ux + spriteSize / 2, uy + spriteSize / 2, spriteSize / 2 - 2, 0, Math.PI * 2);
             ctx.fill();
           }
-          // Ring
-          ctx.strokeStyle = unit.isEnemy ? "#ef4444" : "#22c55e";
+          // Border ring
+          ctx.strokeStyle = unit.isEnemy ? "rgba(239,68,68,0.8)" : "rgba(34,197,94,0.8)";
           ctx.lineWidth = 1.5;
           ctx.beginPath();
           ctx.arc(ux + spriteSize / 2, uy + spriteSize / 2, spriteSize / 2, 0, Math.PI * 2);
           ctx.stroke();
           // HP bar
           const hpPct = unit.currentHealth / (unit.maxHealth || 1);
-          ctx.fillStyle = "#000";
-          ctx.fillRect(ux + 1, uy + spriteSize, spriteSize - 2, 3);
+          ctx.fillStyle = "rgba(0,0,0,0.7)";
+          ctx.fillRect(ux + 1, uy + spriteSize + 1, spriteSize - 2, 3);
           ctx.fillStyle = hpPct > 0.5 ? "#22c55e" : hpPct > 0.25 ? "#eab308" : "#ef4444";
-          ctx.fillRect(ux + 1, uy + spriteSize, (spriteSize - 2) * hpPct, 3);
+          ctx.fillRect(ux + 1, uy + spriteSize + 1, (spriteSize - 2) * hpPct, 3);
         });
         if (tile.units.length > 3) {
           ctx.fillStyle = "#fbbf24";
           ctx.font = "bold 9px system-ui";
           ctx.textAlign = "right";
-          ctx.fillText(`+${tile.units.length - 3}`, px + TILE_SIZE - 3, py + 12);
+          ctx.fillText(`+${tile.units.length - 3}`, px + TILE_SIZE - 2, py + 12);
+        }
+      }
+
+      // Party position marker on loop
+      if (partyPos >= 0 && partyPos < LOOP_PATH.length) {
+        const [lpx, lpy] = LOOP_PATH[partyPos];
+        if (x === lpx && y === lpy) {
+          // Pulsing green ring for party position
+          const cx = px + TILE_SIZE / 2;
+          const cy = py + TILE_SIZE / 2;
+          ctx.strokeStyle = "rgba(34, 197, 94, 0.9)";
+          ctx.lineWidth = 2.5;
+          ctx.beginPath();
+          ctx.arc(cx, cy, TILE_SIZE * 0.35, 0, Math.PI * 2);
+          ctx.stroke();
+          // Inner glow
+          const glow = ctx.createRadialGradient(cx, cy, 2, cx, cy, TILE_SIZE * 0.35);
+          glow.addColorStop(0, "rgba(34, 197, 94, 0.2)");
+          glow.addColorStop(1, "rgba(34, 197, 94, 0)");
+          ctx.fillStyle = glow;
+          ctx.beginPath();
+          ctx.arc(cx, cy, TILE_SIZE * 0.35, 0, Math.PI * 2);
+          ctx.fill();
+          // "P" label
+          ctx.fillStyle = "#22c55e";
+          ctx.font = "bold 14px system-ui";
+          ctx.textAlign = "center";
+          ctx.textBaseline = "middle";
+          ctx.fillText("⚔", cx, cy);
+          ctx.textBaseline = "alphabetic";
         }
       }
     }
   }
+
+  // ─── Pass 4: Fog edge vignette ───
+  // Darken edges where fog meets discovered tiles for atmosphere
+  const edgeGrad = ctx.createRadialGradient(cw / 2, ch / 2, cw * 0.3, cw / 2, ch / 2, cw * 0.55);
+  edgeGrad.addColorStop(0, "rgba(0,0,0,0)");
+  edgeGrad.addColorStop(1, "rgba(6,6,16,0.5)");
+  ctx.fillStyle = edgeGrad;
+  ctx.fillRect(0, 0, cw, ch);
 }
 
 // ─── Combat Panel Component ──────────────────────────────────
@@ -597,6 +687,9 @@ export default function GameView() {
   const [dragTile, setDragTile] = useState<string | null>(null);
   const [placingTorch, setPlacingTorch] = useState(false);
   const [log, setLog] = useState<string[]>(["Welcome to Cursebound! Place tiles from your hand onto the map."]);
+  const [partyLoopIndex, setPartyLoopIndex] = useState(0);
+  const [isWalking, setIsWalking] = useState(false);
+  const walkTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [activeTab, setActiveTab] = useState<"info" | "upgrades" | "merges">("info");
   const [imagesReady, setImagesReady] = useState(false);
   const [tileHand, setTileHand] = useState<string[]>(() =>
@@ -626,8 +719,8 @@ export default function GameView() {
     const totalSize = TILE_SIZE + TILE_GAP;
     canvas.width = CANVAS_PADDING * 2 + GRID_SIZE * totalSize;
     canvas.height = CANVAS_PADDING * 2 + GRID_SIZE * totalSize;
-    drawGrid(ctx, gameState, hoveredTile, selectedTile, dragTile, placingTorch);
-  }, [gameState, hoveredTile, selectedTile, dragTile, placingTorch, imagesReady]);
+    drawGrid(ctx, gameState, hoveredTile, selectedTile, dragTile, placingTorch, partyLoopIndex);
+  }, [gameState, hoveredTile, selectedTile, dragTile, placingTorch, imagesReady, partyLoopIndex]);
 
   // Mouse handlers
   const getTileCoords = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -876,6 +969,68 @@ export default function GameView() {
     addLog(`🌅 Day ${gameState.day + 1} dawns. +1 🔥 torch. The curse grows...`);
   };
 
+  // ─── Auto-walk Logic ──────────────────────────────────────
+
+  const walkOneStep = useCallback(() => {
+    setPartyLoopIndex((prev) => {
+      const next = (prev + 1) % LOOP_PATH.length;
+      const [tx, ty] = LOOP_PATH[next];
+      const tile = gameState.map[ty][tx];
+
+      // Check for enemies on this tile
+      const enemies = tile.units.filter((u) => u.isEnemy);
+      if (enemies.length > 0) {
+        // Stop walking and auto-trigger combat
+        setIsWalking(false);
+        setSelectedTile({ x: tx, y: ty });
+        addLog(`⚔️ Party encounters ${enemies.length} enem${enemies.length > 1 ? "ies" : "y"} on ${tile.tileName}!`);
+        // Auto-start combat on next tick
+        setTimeout(() => {
+          setGameState((prev2) => {
+            const allies = prev2.map.flat().flatMap((t) => t.units.filter((u) => !u.isEnemy));
+            if (allies.length === 0) return prev2;
+            const next2 = JSON.parse(JSON.stringify(prev2)) as GameState;
+            next2.combat = initCombat(allies, enemies, tile.tileName, tx, ty);
+            return next2;
+          });
+        }, 200);
+        return next;
+      }
+
+      // Full loop completed
+      if (next === 0) {
+        setIsWalking(false);
+        addLog("🔄 Loop complete! Ending day...");
+        setTimeout(() => endDay(), 300);
+        return next;
+      }
+
+      return next;
+    });
+  }, [gameState, addLog]);
+
+  // Walking timer effect
+  useEffect(() => {
+    if (isWalking) {
+      walkTimerRef.current = setInterval(walkOneStep, 600);
+    } else if (walkTimerRef.current) {
+      clearInterval(walkTimerRef.current);
+      walkTimerRef.current = null;
+    }
+    return () => {
+      if (walkTimerRef.current) clearInterval(walkTimerRef.current);
+    };
+  }, [isWalking, walkOneStep]);
+
+  const toggleWalk = () => {
+    if (gameState.combat?.active) {
+      addLog("⚠️ Resolve combat first!");
+      return;
+    }
+    setIsWalking((prev) => !prev);
+    if (!isWalking) addLog("🚶 Party begins walking the loop...");
+  };
+
   const startCombat = () => {
     if (gameState.combat?.active) { addLog("Combat already in progress!"); return; }
     if (!selectedTile) { addLog("Select a tile with enemies first!"); return; }
@@ -1014,6 +1169,16 @@ export default function GameView() {
           >
             🔥 Torch
           </button>
+          <button
+            onClick={toggleWalk}
+            className={`px-2 py-1 rounded text-xs font-medium transition-colors border ${
+              isWalking
+                ? "bg-green-800/50 border-green-700 text-green-200 animate-pulse"
+                : "bg-green-900/30 border-green-900/30 text-green-400 hover:bg-green-800/40"
+            }`}
+          >
+            {isWalking ? "⏸ Stop" : "🚶 Walk"}
+          </button>
           <button onClick={startCombat} className="px-2 py-1 rounded bg-red-900/40 hover:bg-red-800/50 text-red-300 text-xs font-medium transition-colors border border-red-900/30">
             ⚔️ Fight
           </button>
@@ -1024,6 +1189,7 @@ export default function GameView() {
             setGameState(createInitialState());
             setTileHand(Array.from({ length: 5 }, () => STARTING_TILES[Math.floor(Math.random() * STARTING_TILES.length)]));
             setLog(["Game reset."]); setSelectedTile(null); setDragTile(null); setPlacingTorch(false);
+            setPartyLoopIndex(0); setIsWalking(false);
           }} className="px-2 py-1 rounded bg-gray-800 hover:bg-gray-700 text-gray-400 text-xs border border-gray-700/50">
             🔄
           </button>
