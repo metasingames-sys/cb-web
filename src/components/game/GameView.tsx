@@ -27,23 +27,26 @@ import type {
 // ─── Constants ───────────────────────────────────────────────
 
 const GRID_SIZE = 10;
-const TILE_SIZE = 64;
 const TILE_GAP = 0;
-const CANVAS_PADDING = 0;
 const CAMP_LIGHT_RADIUS = 3;
 const TORCH_LIGHT_RADIUS = 2;
 const SPRITE_SCALE = 1.15; // sprites render 15% larger for alpha overlap
 
-// Loop Hero-style road circuit (clockwise from top-left)
+// Loop Hero-style winding road circuit (clockwise from camp)
+// Camp is ON the path at position 0
 const LOOP_PATH: [number, number][] = [
-  // Top row (left to right)
-  [2,2], [3,2], [4,2], [5,2], [6,2], [7,2],
-  // Right column (top to bottom)
-  [7,3], [7,4], [7,5], [7,6],
-  // Bottom row (right to left)
-  [7,7], [6,7], [5,7], [4,7], [3,7], [2,7],
-  // Left column (bottom to top)
-  [2,6], [2,5], [2,4], [2,3],
+  [4,7],         // Camp position (start/end)
+  [5,7], [6,7],  // bottom-right
+  [6,6], [7,6],  // jog right
+  [7,5], [7,4],  // right column up
+  [7,3], [6,3],  // jog left
+  [6,2], [6,1],  // right side up to top
+  [5,1], [4,1], [3,1], [2,1], // top straight
+  [2,2],         // corner down
+  [2,3], [1,3],  // jog left
+  [1,4], [1,5],  // left column down
+  [1,6], [2,6],  // jog right
+  [2,7], [3,7],  // bottom-left back to camp
 ];
 
 // Track sprite dimensions for overflow rendering
@@ -183,33 +186,32 @@ function createInitialState(): GameState {
     }
   }
 
-  // Place road loop (Loop Hero-style circuit) — roads are always visible
-  LOOP_PATH.forEach(([rx, ry]) => {
-    map[ry][rx] = {
-      tileTypeId: 4, tileName: "Road", x: rx, y: ry, units: [],
-      visibility: TileVisibility.Active,
-      isLightSource: true, lightRadius: 1, // roads illuminate adjacent tiles
-    };
+  // Place road loop — camp is position 0, rest are roads
+  const [campX, campY] = LOOP_PATH[0];
+  LOOP_PATH.forEach(([rx, ry], i) => {
+    if (i === 0) {
+      // Camp tile — on the path, major light source
+      map[ry][rx] = {
+        tileTypeId: 3, tileName: "Camp", x: rx, y: ry, units: [],
+        visibility: TileVisibility.Active,
+        isLightSource: true, lightRadius: CAMP_LIGHT_RADIUS,
+      };
+    } else {
+      map[ry][rx] = {
+        tileTypeId: 4, tileName: "Road", x: rx, y: ry, units: [],
+        visibility: TileVisibility.Active,
+        isLightSource: true, lightRadius: 1,
+      };
+    }
   });
-
-  // Place camp at center of loop (5,5)
-  const campX = 5, campY = 5;
-  map[campY][campX] = {
-    tileTypeId: 3, tileName: "Camp", x: campX, y: campY, units: [],
-    visibility: TileVisibility.Active,
-    isLightSource: true, lightRadius: CAMP_LIGHT_RADIUS,
-  };
 
   // Place warrior at camp
   const warrior = unitTypes.find((u) => u.name === "Warrior")!;
   map[campY][campX].units.push(createUnitInstance(warrior, false));
 
-  // Compute initial fog — camp light reveals the loop and nearby tiles
+  // Compute visibility — camp + roads illuminate the loop and surroundings
   computeVisibility(map);
-  // Also discover all tiles adjacent to the loop
-  LOOP_PATH.forEach(([rx, ry]) => {
-    discoverAround(map, rx, ry, 1);
-  });
+  LOOP_PATH.forEach(([rx, ry]) => discoverAround(map, rx, ry, 1));
   computeVisibility(map);
 
   return {
@@ -251,8 +253,11 @@ function drawGrid(
   dragTile: string | null,
   placingTorch: boolean,
   partyPos: number,
+  ts: number, // dynamic tile size
 ) {
   const { map } = state;
+  const TILE_SIZE = ts;
+  const CANVAS_PADDING = 0;
   const totalSize = TILE_SIZE + TILE_GAP;
   const cw = ctx.canvas.width;
   const ch = ctx.canvas.height;
@@ -306,6 +311,24 @@ function drawGrid(
         ctx.fillRect(px, py, TILE_SIZE, TILE_SIZE);
       }
     }
+  }
+
+  // ─── Pass 1.5: Road connection strips ───
+  // Draw brown path connections between adjacent road/camp tiles
+  ctx.strokeStyle = "rgba(90, 75, 50, 0.4)";
+  ctx.lineWidth = TILE_SIZE * 0.35;
+  ctx.lineCap = "round";
+  for (let i = 0; i < LOOP_PATH.length; i++) {
+    const [x1, y1] = LOOP_PATH[i];
+    const [x2, y2] = LOOP_PATH[(i + 1) % LOOP_PATH.length];
+    const cx1 = CANVAS_PADDING + x1 * totalSize + TILE_SIZE / 2;
+    const cy1 = CANVAS_PADDING + y1 * totalSize + TILE_SIZE / 2;
+    const cx2 = CANVAS_PADDING + x2 * totalSize + TILE_SIZE / 2;
+    const cy2 = CANVAS_PADDING + y2 * totalSize + TILE_SIZE / 2;
+    ctx.beginPath();
+    ctx.moveTo(cx1, cy1);
+    ctx.lineTo(cx2, cy2);
+    ctx.stroke();
   }
 
   // ─── Pass 2: Tile sprites (top to bottom for correct overlap) ───
@@ -708,6 +731,8 @@ function UpgradeShop({
 
 export default function GameView() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const mapContainerRef = useRef<HTMLDivElement>(null);
+  const [tileSize, setTileSize] = useState(64);
   const [gameState, setGameState] = useState<GameState>(() => createInitialState());
   const [selectedTile, setSelectedTile] = useState<{ x: number; y: number } | null>(null);
   const [hoveredTile, setHoveredTile] = useState<{ x: number; y: number } | null>(null);
@@ -737,17 +762,34 @@ export default function GameView() {
     return () => clearInterval(interval);
   }, []);
 
+  // Responsive tile sizing
+  useEffect(() => {
+    const measure = () => {
+      const container = mapContainerRef.current;
+      if (!container) return;
+      // Fill available width/height, whichever is smaller
+      const w = container.clientWidth;
+      const h = window.innerHeight - 200; // reserve space for status bar + hand
+      const available = Math.min(w, h);
+      const ts = Math.max(48, Math.floor(available / GRID_SIZE));
+      setTileSize(ts);
+    };
+    measure();
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+  }, []);
+
   // Canvas rendering
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    const totalSize = TILE_SIZE + TILE_GAP;
-    canvas.width = CANVAS_PADDING * 2 + GRID_SIZE * totalSize;
-    canvas.height = CANVAS_PADDING * 2 + GRID_SIZE * totalSize;
-    drawGrid(ctx, gameState, hoveredTile, selectedTile, dragTile, placingTorch, partyLoopIndex);
-  }, [gameState, hoveredTile, selectedTile, dragTile, placingTorch, imagesReady, partyLoopIndex]);
+    const totalSize = tileSize + TILE_GAP;
+    canvas.width = GRID_SIZE * totalSize;
+    canvas.height = GRID_SIZE * totalSize;
+    drawGrid(ctx, gameState, hoveredTile, selectedTile, dragTile, placingTorch, partyLoopIndex, tileSize);
+  }, [gameState, hoveredTile, selectedTile, dragTile, placingTorch, imagesReady, partyLoopIndex, tileSize]);
 
   // Mouse handlers
   const getTileCoords = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -756,9 +798,9 @@ export default function GameView() {
     const rect = canvas.getBoundingClientRect();
     const scaleX = canvas.width / rect.width;
     const scaleY = canvas.height / rect.height;
-    const mx = (e.clientX - rect.left) * scaleX - CANVAS_PADDING;
-    const my = (e.clientY - rect.top) * scaleY - CANVAS_PADDING;
-    const totalSize = TILE_SIZE + TILE_GAP;
+    const mx = (e.clientX - rect.left) * scaleX;
+    const my = (e.clientY - rect.top) * scaleY;
+    const totalSize = tileSize + TILE_GAP;
     const x = Math.floor(mx / totalSize);
     const y = Math.floor(my / totalSize);
     if (x >= 0 && x < GRID_SIZE && y >= 0 && y < GRID_SIZE) return { x, y };
@@ -986,6 +1028,20 @@ export default function GameView() {
         })
       );
 
+      // Spawn enemies on random road tiles (Loop Hero-style daily spawning)
+      const roadTiles = LOOP_PATH
+        .map(([lx, ly]) => next.map[ly][lx])
+        .filter((t) => t.tileName === "Road" && t.units.filter((u) => u.isEnemy).length === 0);
+      const enemiesToSpawn = Math.min(1 + Math.floor(next.day / 3), 4); // more as days progress
+      const enemyIds = [3, 5, 6, 8, 10]; // Imp, Acolyte, Cultist, Skeleton, Ghoul
+      for (let i = 0; i < enemiesToSpawn && roadTiles.length > 0; i++) {
+        const idx = Math.floor(Math.random() * roadTiles.length);
+        const rt = roadTiles.splice(idx, 1)[0];
+        const eid = enemyIds[Math.floor(Math.random() * enemyIds.length)];
+        const eType = getUnitByIdKey(eid);
+        if (eType) rt.units.push(createUnitInstance(eType, true));
+      }
+
       next.resources.flesh += 2;
       next.resources.mana += 1;
       next.torchCount += 1; // earn a torch each day
@@ -1151,10 +1207,10 @@ export default function GameView() {
 
   const curseMax = curseData.settings.basePointsNeeded * (gameState.curseLevel + 1);
   const cursePct = Math.min((gameState.cursePoints / curseMax) * 100, 100);
-  const canvasTotal = CANVAS_PADDING * 2 + GRID_SIZE * (TILE_SIZE + TILE_GAP);
+  const canvasTotal = GRID_SIZE * (tileSize + TILE_GAP);
 
   return (
-    <div className="space-y-3">
+    <div className="flex flex-col h-screen overflow-hidden">
       {/* Status Bar */}
       <div className="flex flex-wrap gap-3 items-center p-2.5 rounded-lg bg-gray-900/80 border border-gray-800 backdrop-blur-sm">
         <div className="text-sm">
@@ -1223,13 +1279,13 @@ export default function GameView() {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-[auto_320px] gap-3">
+      <div className="flex-1 grid grid-cols-1 lg:grid-cols-[1fr_300px] gap-2 min-h-0 overflow-hidden px-2">
         {/* Map + Hand */}
-        <div className="space-y-2">
+        <div className="flex flex-col min-h-0 gap-1" ref={mapContainerRef}>
           <canvas
             ref={canvasRef}
-            className="rounded-lg border border-gray-800 cursor-pointer shadow-xl shadow-black/40"
-            style={{ width: canvasTotal, height: canvasTotal }}
+            className="rounded-lg border border-gray-800 cursor-pointer shadow-xl shadow-black/40 mx-auto"
+            style={{ width: canvasTotal, height: canvasTotal, maxWidth: "100%", maxHeight: "calc(100vh - 200px)" }}
             onClick={handleCanvasClick}
             onMouseMove={handleCanvasMove}
             onMouseLeave={() => setHoveredTile(null)}
