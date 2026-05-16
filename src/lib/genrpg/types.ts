@@ -212,15 +212,31 @@ export interface TileCategory {
 
 // ─── Unit Types ──────────────────────────────────────────────
 
+export interface UnitLevelData {
+  maxHealth?: number;
+  minDam?: number;
+  maxDam?: number;
+  evasion?: number;
+  counter?: number;
+  attackSpeed?: number;
+  defense?: number;
+  critChance?: number;
+  critDamage?: number;
+  shield?: number;
+  magicDamage?: number;
+  healing?: number;
+  taunt?: number;
+  leadership?: number;
+}
+
 export interface UnitType {
-  id: string;
   idKey: number;
   name: string;
   icon: string;
   art: string;
   desc: string;
   maxQuantityOnMap: number;
-  combatRow: number;
+  combatRow: string;
   // Base stats
   maxHealth: number;
   minDam: number;
@@ -228,23 +244,23 @@ export interface UnitType {
   evasion: number;
   counter: number;
   vampiric: number;
-  attackSpeed: number;
+  attackSpeed: number;   // milliseconds per attack
   defense: number;
   critChance: number;
   critDamage: number;
-  damagePercentPerSecond: number;
+  shield: number;
   magicDamage: number;
-  maxHealthPercent: number;
-  maxDamagePercent: number;
   healing: number;
   taunt: number;
-  allyStatScale: number;
   lootScale: number;
   joinChanceScale: number;
   leadership: number;
-  customPrefab: string;
+  attackType: string;
+  range: string;
+  aoe: string;
   isBoss: boolean;
   attackFX: string;
+  levels: UnitLevelData[];  // Per-level stat overrides
 }
 
 export interface StatVal {
@@ -284,7 +300,6 @@ export interface UpgradePrereq {
 }
 
 export interface UpgradeType {
-  id: string;
   idKey: number;
   name: string;
   icon: string;
@@ -342,6 +357,60 @@ export interface ManaType {
 
 // ─── Game State ──────────────────────────────────────────────
 
+// ─── Fog of War States ───────────────────────────────────────
+
+export enum TileVisibility {
+  Foggy = 0,       // Covered in fog — invisible and unplaceable
+  Discovered = 1,  // Fog removed, but no light source. Can place tiles but they don't function
+  Empty = 2,       // Visible, unoccupied, within light range
+  Filled = 3,      // Visible, has a tile, may not be active
+  Active = 4,      // Filled + illuminated by light source — fully functional
+}
+
+// ─── Combat Types ────────────────────────────────────────────
+
+export interface CombatUnit {
+  instance: UnitInstance;
+  currentHealth: number;
+  maxHealth: number;
+  shield: number;
+  cooldownMs: number;     // ms until next attack (decremented each tick)
+  isAlive: boolean;
+  targetId: string | null;
+  totalDamageDealt: number;
+  totalDamageTaken: number;
+  totalHealing: number;
+}
+
+export interface CombatState {
+  active: boolean;
+  tileName: string;
+  tileX: number;
+  tileY: number;
+  allies: CombatUnit[];
+  enemies: CombatUnit[];
+  round: number;
+  roundTimeMs: number;     // ms elapsed in current round
+  roundDurationMs: number; // total round duration (e.g. 10000ms)
+  isPaused: boolean;       // intermission phase
+  log: CombatLogEntry[];
+  result: "pending" | "victory" | "defeat";
+  speed: number;           // 1x, 2x, 4x
+}
+
+export interface CombatLogEntry {
+  round: number;
+  timeMs: number;
+  type: "attack" | "crit" | "evade" | "counter" | "magic" | "heal" | "shield" | "death" | "round" | "result";
+  actorName: string;
+  targetName?: string;
+  damage?: number;
+  healing?: number;
+  message: string;
+}
+
+// ─── Game State ──────────────────────────────────────────────
+
 export interface GameState {
   day: number;
   cursePoints: number;
@@ -357,6 +426,9 @@ export interface GameState {
   upgrades: Record<number, number>;  // upgradeId -> current tier
   draftRerolls: { unit: number; tile: number };
   draftChoices: { unit: number; tile: number };
+  torchCount: number;
+  baseUpgrades: number;
+  combat: CombatState | null;
 }
 
 export interface MapTile {
@@ -365,6 +437,9 @@ export interface MapTile {
   x: number;
   y: number;
   units: UnitInstance[];
+  visibility: TileVisibility;
+  isLightSource: boolean;  // torch tile or camp
+  lightRadius: number;     // how far the light reaches
 }
 
 export interface UnitInstance {
@@ -373,6 +448,8 @@ export interface UnitInstance {
   name: string;
   level: number;
   currentHealth: number;
+  maxHealth: number;
   stats: Record<number, number>;  // statTypeId -> value
   isEnemy: boolean;
+  traits: string[];  // future: trait IDs
 }

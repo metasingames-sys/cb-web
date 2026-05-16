@@ -12,15 +12,26 @@ import {
   getUnitByIdKey,
   getMergeOutput,
   getTileByName,
+  upgradeTypes,
+  initCombat,
+  simulateRound,
+  getCombatSummary,
 } from "@/lib/genrpg";
-import type { GameState, MapTile, UnitInstance, UnitType, TileType } from "@/lib/genrpg";
+import {
+  TileVisibility,
+} from "@/lib/genrpg/types";
+import type {
+  GameState, MapTile, UnitInstance, UnitType, CombatState, CombatLogEntry,
+} from "@/lib/genrpg";
 
 // ─── Constants ───────────────────────────────────────────────
 
-const GRID_SIZE = 8;
-const TILE_SIZE = 72;
+const GRID_SIZE = 10;
+const TILE_SIZE = 64;
 const TILE_GAP = 2;
-const CANVAS_PADDING = 16;
+const CANVAS_PADDING = 12;
+const CAMP_LIGHT_RADIUS = 2;
+const TORCH_LIGHT_RADIUS = 2;
 
 const PLACEABLE_TILES = [
   "Meadow", "Hill", "Copse", "Spring", "Forest", "Field",
@@ -29,13 +40,6 @@ const PLACEABLE_TILES = [
 ];
 const STARTING_TILES = ["Meadow", "Hill", "Copse", "Spring", "Field", "Pasture"];
 
-const RESOURCE_NAMES = ["crystal", "mana", "matter", "flesh"] as const;
-const RESOURCE_ICON_MAP: Record<string, string> = {
-  crystal: "IconCrystal",
-  mana: "IconMana",
-  matter: "IconMatter",
-  flesh: "IconFlesh",
-};
 const RESOURCE_EMOJI: Record<string, string> = {
   crystal: "💎", mana: "🔮", matter: "⚙️", flesh: "🩸",
 };
@@ -44,40 +48,94 @@ const RESOURCE_EMOJI: Record<string, string> = {
 
 const imageCache: Record<string, HTMLImageElement> = {};
 const imageLoading: Set<string> = new Set();
+const imageFailed: Set<string> = new Set();
 
 function getImage(src: string): HTMLImageElement | null {
   if (imageCache[src]) return imageCache[src];
-  if (imageLoading.has(src)) return null;
+  if (imageLoading.has(src) || imageFailed.has(src)) return null;
   imageLoading.add(src);
   const img = new Image();
   img.crossOrigin = "anonymous";
   img.src = src;
-  img.onload = () => {
-    imageCache[src] = img;
-    imageLoading.delete(src);
-  };
-  img.onerror = () => {
-    imageLoading.delete(src);
-  };
+  img.onload = () => { imageCache[src] = img; imageLoading.delete(src); };
+  img.onerror = () => { imageLoading.delete(src); imageFailed.add(src); };
   return null;
 }
 
 function getTileImagePath(tileName: string): string {
-  // Map tile name to file in /assets/tiles/
-  const name = tileName.replace(/\s+/g, "") + "Tile";
-  return `/assets/tiles/${name}.png`;
+  return `/assets/tiles/${tileName.replace(/\s+/g, "")}Tile.png`;
 }
-
 function getUnitImagePath(unitName: string): string {
   return `/assets/units/${unitName.replace(/\s+/g, "")}.png`;
 }
-
 function getPortraitPath(unitName: string): string {
   return `/assets/portraits/Portraits_${unitName.replace(/\s+/g, "")}.png`;
 }
 
-function getIconPath(iconName: string): string {
-  return `/assets/icons/${iconName}.png`;
+// ─── Fog of War Helpers ──────────────────────────────────────
+
+function computeVisibility(map: MapTile[][]): void {
+  const size = map.length;
+  // Reset all to foggy first (unless we keep discovered)
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const tile = map[y][x];
+      // Keep discovered state, only remove Active
+      if (tile.visibility === TileVisibility.Active) {
+        tile.visibility = tile.tileName !== "Blank"
+          ? TileVisibility.Filled
+          : TileVisibility.Discovered;
+      }
+    }
+  }
+
+  // Find all light sources and illuminate
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const tile = map[y][x];
+      if (tile.isLightSource && tile.lightRadius > 0) {
+        illuminate(map, x, y, tile.lightRadius);
+      }
+    }
+  }
+}
+
+function illuminate(map: MapTile[][], cx: number, cy: number, radius: number): void {
+  const size = map.length;
+  for (let dy = -radius; dy <= radius; dy++) {
+    for (let dx = -radius; dx <= radius; dx++) {
+      const nx = cx + dx;
+      const ny = cy + dy;
+      if (nx < 0 || nx >= size || ny < 0 || ny >= size) continue;
+      const dist = Math.abs(dx) + Math.abs(dy); // Manhattan distance
+      if (dist > radius) continue;
+      const tile = map[ny][nx];
+      if (tile.visibility === TileVisibility.Foggy) {
+        tile.visibility = TileVisibility.Discovered;
+      }
+      // Within light radius and has content → Active
+      if (tile.tileName !== "Blank") {
+        tile.visibility = TileVisibility.Active;
+      } else if (tile.visibility < TileVisibility.Empty) {
+        tile.visibility = TileVisibility.Empty;
+      }
+    }
+  }
+}
+
+function discoverAround(map: MapTile[][], cx: number, cy: number, radius: number): void {
+  const size = map.length;
+  for (let dy = -radius; dy <= radius; dy++) {
+    for (let dx = -radius; dx <= radius; dx++) {
+      const nx = cx + dx;
+      const ny = cy + dy;
+      if (nx < 0 || nx >= size || ny < 0 || ny >= size) continue;
+      if (Math.abs(dx) + Math.abs(dy) > radius) continue;
+      if (map[ny][nx].visibility === TileVisibility.Foggy) {
+        map[ny][nx].visibility = TileVisibility.Discovered;
+      }
+    }
+  }
 }
 
 // ─── Game State ──────────────────────────────────────────────
@@ -87,19 +145,38 @@ function createInitialState(): GameState {
   for (let y = 0; y < GRID_SIZE; y++) {
     map[y] = [];
     for (let x = 0; x < GRID_SIZE; x++) {
-      map[y][x] = { tileTypeId: 2, tileName: "Blank", x, y, units: [] };
+      map[y][x] = {
+        tileTypeId: 2, tileName: "Blank", x, y, units: [],
+        visibility: TileVisibility.Foggy,
+        isLightSource: false, lightRadius: 0,
+      };
     }
   }
   const mid = Math.floor(GRID_SIZE / 2);
-  // Place camp + roads
-  map[mid][mid] = { tileTypeId: 3, tileName: "Camp", x: mid, y: mid, units: [] };
-  map[mid][mid - 1] = { tileTypeId: 4, tileName: "Road", x: mid - 1, y: mid, units: [] };
-  map[mid][mid + 1] = { tileTypeId: 4, tileName: "Road", x: mid + 1, y: mid, units: [] };
-  map[mid - 1][mid] = { tileTypeId: 4, tileName: "Road", x: mid, y: mid - 1, units: [] };
-  map[mid + 1][mid] = { tileTypeId: 4, tileName: "Road", x: mid, y: mid + 1, units: [] };
 
+  // Place camp (light source)
+  map[mid][mid] = {
+    tileTypeId: 3, tileName: "Camp", x: mid, y: mid, units: [],
+    visibility: TileVisibility.Active,
+    isLightSource: true, lightRadius: CAMP_LIGHT_RADIUS,
+  };
+
+  // Roads around camp
+  const roadPositions = [[mid, mid - 1], [mid, mid + 1], [mid - 1, mid], [mid + 1, mid]];
+  roadPositions.forEach(([ry, rx]) => {
+    map[ry][rx] = {
+      tileTypeId: 4, tileName: "Road", x: rx, y: ry, units: [],
+      visibility: TileVisibility.Active,
+      isLightSource: false, lightRadius: 0,
+    };
+  });
+
+  // Place warrior at camp
   const warrior = unitTypes.find((u) => u.name === "Warrior")!;
   map[mid][mid].units.push(createUnitInstance(warrior, false));
+
+  // Compute initial fog
+  computeVisibility(map);
 
   return {
     day: 1, cursePoints: 0, curseLevel: 0, map, party: [],
@@ -107,6 +184,9 @@ function createInitialState(): GameState {
     upgrades: {},
     draftRerolls: { unit: 2, tile: 2 },
     draftChoices: { unit: 3, tile: 3 },
+    torchCount: 1,
+    baseUpgrades: 0,
+    combat: null,
   };
 }
 
@@ -115,11 +195,15 @@ function createUnitInstance(unitType: UnitType, isEnemy: boolean): UnitInstance 
     id: `${unitType.name}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
     unitTypeId: unitType.idKey, name: unitType.name, level: 1,
     currentHealth: unitType.maxHealth,
+    maxHealth: unitType.maxHealth,
     stats: {
       1: unitType.maxHealth, 3: unitType.minDam, 4: unitType.maxDam,
-      5: unitType.evasion, 6: unitType.counter, 8: unitType.attackSpeed, 9: unitType.defense,
+      5: unitType.evasion, 6: unitType.counter, 8: unitType.attackSpeed,
+      9: unitType.defense, 13: unitType.critChance, 16: unitType.magicDamage,
+      20: unitType.healing, 25: unitType.taunt,
     },
     isEnemy,
+    traits: [],
   };
 }
 
@@ -131,14 +215,12 @@ function drawGrid(
   hoveredTile: { x: number; y: number } | null,
   selectedTile: { x: number; y: number } | null,
   dragTile: string | null,
+  placingTorch: boolean,
 ) {
   const { map } = state;
   const totalSize = TILE_SIZE + TILE_GAP;
-
   ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
-
-  // Dark background
-  ctx.fillStyle = "#080812";
+  ctx.fillStyle = "#060610";
   ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height);
 
   for (let y = 0; y < GRID_SIZE; y++) {
@@ -148,120 +230,361 @@ function drawGrid(
       const py = CANVAS_PADDING + y * totalSize;
       const isHovered = hoveredTile?.x === x && hoveredTile?.y === y;
       const isSelected = selectedTile?.x === x && selectedTile?.y === y;
+      const vis = tile.visibility;
+
+      // ─── Foggy tiles ───
+      if (vis === TileVisibility.Foggy) {
+        ctx.fillStyle = "#0a0a14";
+        ctx.beginPath();
+        ctx.roundRect(px, py, TILE_SIZE, TILE_SIZE, 3);
+        ctx.fill();
+        // Fog pattern
+        ctx.fillStyle = "rgba(30, 20, 50, 0.6)";
+        for (let i = 0; i < 3; i++) {
+          const fx = px + 8 + (i * 18) + Math.sin(y * 3 + i) * 4;
+          const fy = py + 20 + Math.cos(x * 2 + i) * 8;
+          ctx.beginPath();
+          ctx.arc(fx, fy, 10, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        continue;
+      }
+
+      // ─── Discovered but dim ───
+      const isDim = vis === TileVisibility.Discovered || vis === TileVisibility.Filled;
       const isBlank = tile.tileName === "Blank";
 
-      // Try to draw tile image
       if (!isBlank) {
         const img = getImage(getTileImagePath(tile.tileName));
         if (img) {
+          if (isDim) ctx.globalAlpha = 0.45;
           ctx.drawImage(img, px, py, TILE_SIZE, TILE_SIZE);
+          ctx.globalAlpha = 1;
         } else {
-          // Fallback color
           ctx.fillStyle = tileColors[tile.tileName] || "#1a1a2e";
+          if (isDim) ctx.globalAlpha = 0.45;
           ctx.beginPath();
-          ctx.roundRect(px, py, TILE_SIZE, TILE_SIZE, 4);
+          ctx.roundRect(px, py, TILE_SIZE, TILE_SIZE, 3);
           ctx.fill();
+          ctx.globalAlpha = 1;
         }
       } else {
-        // Blank tile
-        ctx.fillStyle = "#0e0e1a";
+        // Empty/Discovered blank
+        ctx.fillStyle = vis >= TileVisibility.Empty ? "#0d0d1c" : "#090914";
         ctx.beginPath();
-        ctx.roundRect(px, py, TILE_SIZE, TILE_SIZE, 4);
+        ctx.roundRect(px, py, TILE_SIZE, TILE_SIZE, 3);
         ctx.fill();
-        ctx.strokeStyle = "#1e1e30";
-        ctx.lineWidth = 1;
-        ctx.setLineDash([4, 4]);
-        ctx.beginPath();
-        ctx.roundRect(px + 1, py + 1, TILE_SIZE - 2, TILE_SIZE - 2, 3);
-        ctx.stroke();
-        ctx.setLineDash([]);
+        if (vis >= TileVisibility.Empty) {
+          ctx.strokeStyle = "#1e1e30";
+          ctx.lineWidth = 1;
+          ctx.setLineDash([3, 3]);
+          ctx.beginPath();
+          ctx.roundRect(px + 1, py + 1, TILE_SIZE - 2, TILE_SIZE - 2, 2);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
       }
 
-      // Hover highlight for placeable blank
-      if (isHovered && isBlank && dragTile) {
-        ctx.fillStyle = "rgba(255, 255, 255, 0.08)";
-        ctx.beginPath();
-        ctx.roundRect(px, py, TILE_SIZE, TILE_SIZE, 4);
-        ctx.fill();
-        ctx.strokeStyle = "rgba(251, 191, 36, 0.5)";
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.roundRect(px + 1, py + 1, TILE_SIZE - 2, TILE_SIZE - 2, 3);
-        ctx.stroke();
+      // Light source glow
+      if (tile.isLightSource) {
+        const gradient = ctx.createRadialGradient(
+          px + TILE_SIZE / 2, py + TILE_SIZE / 2, 4,
+          px + TILE_SIZE / 2, py + TILE_SIZE / 2, TILE_SIZE * 0.7,
+        );
+        gradient.addColorStop(0, "rgba(255, 200, 60, 0.15)");
+        gradient.addColorStop(1, "rgba(255, 200, 60, 0)");
+        ctx.fillStyle = gradient;
+        ctx.fillRect(px, py, TILE_SIZE, TILE_SIZE);
+      }
+
+      // Hover highlight
+      if (isHovered) {
+        const canPlace = isBlank && vis >= TileVisibility.Discovered && (dragTile || placingTorch);
+        if (canPlace) {
+          ctx.fillStyle = placingTorch
+            ? "rgba(255, 200, 60, 0.12)"
+            : "rgba(255, 255, 255, 0.08)";
+          ctx.beginPath();
+          ctx.roundRect(px, py, TILE_SIZE, TILE_SIZE, 3);
+          ctx.fill();
+          ctx.strokeStyle = placingTorch ? "rgba(255, 200, 60, 0.6)" : "rgba(251, 191, 36, 0.5)";
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.roundRect(px + 1, py + 1, TILE_SIZE - 2, TILE_SIZE - 2, 2);
+          ctx.stroke();
+        }
       }
 
       // Selected glow
       if (isSelected) {
         ctx.strokeStyle = "#fbbf24";
-        ctx.lineWidth = 2.5;
+        ctx.lineWidth = 2;
         ctx.shadowColor = "#fbbf24";
-        ctx.shadowBlur = 8;
+        ctx.shadowBlur = 6;
         ctx.beginPath();
-        ctx.roundRect(px, py, TILE_SIZE, TILE_SIZE, 4);
+        ctx.roundRect(px, py, TILE_SIZE, TILE_SIZE, 3);
         ctx.stroke();
         ctx.shadowBlur = 0;
       }
 
       // Tile name label
-      if (!isBlank) {
-        ctx.fillStyle = "rgba(0,0,0,0.65)";
-        ctx.fillRect(px, py + TILE_SIZE - 16, TILE_SIZE, 16);
-        ctx.fillStyle = "#fff";
-        ctx.font = "bold 9px system-ui, sans-serif";
+      if (!isBlank && vis >= TileVisibility.Discovered) {
+        ctx.fillStyle = "rgba(0,0,0,0.6)";
+        ctx.fillRect(px, py + TILE_SIZE - 14, TILE_SIZE, 14);
+        ctx.fillStyle = isDim ? "#888" : "#fff";
+        ctx.font = "bold 8px system-ui, sans-serif";
         ctx.textAlign = "center";
-        ctx.fillText(tile.tileName, px + TILE_SIZE / 2, py + TILE_SIZE - 4, TILE_SIZE - 4);
+        ctx.fillText(tile.tileName, px + TILE_SIZE / 2, py + TILE_SIZE - 3, TILE_SIZE - 4);
       }
 
-      // Unit sprites on tile
-      if (tile.units.length > 0) {
+      // Unit sprites
+      if (tile.units.length > 0 && vis >= TileVisibility.Discovered) {
         const maxShow = Math.min(tile.units.length, 3);
-        const spriteSize = 28;
+        const spriteSize = 22;
         const startX = px + (TILE_SIZE - maxShow * (spriteSize + 2)) / 2;
         tile.units.slice(0, maxShow).forEach((unit, i) => {
           const ux = startX + i * (spriteSize + 2);
           const uy = py + 2;
-
-          // Try to load unit sprite
           const unitImg = getImage(getUnitImagePath(unit.name));
           if (unitImg) {
             ctx.drawImage(unitImg, ux, uy, spriteSize, spriteSize);
           } else {
-            // Fallback circle
             ctx.fillStyle = unit.isEnemy ? "#ef4444" : "#22c55e";
             ctx.beginPath();
             ctx.arc(ux + spriteSize / 2, uy + spriteSize / 2, spriteSize / 2 - 2, 0, Math.PI * 2);
             ctx.fill();
           }
-
-          // Enemy/ally indicator ring
+          // Ring
           ctx.strokeStyle = unit.isEnemy ? "#ef4444" : "#22c55e";
           ctx.lineWidth = 1.5;
           ctx.beginPath();
-          ctx.arc(ux + spriteSize / 2, uy + spriteSize / 2, spriteSize / 2 - 1, 0, Math.PI * 2);
+          ctx.arc(ux + spriteSize / 2, uy + spriteSize / 2, spriteSize / 2, 0, Math.PI * 2);
           ctx.stroke();
-
           // HP bar
-          const hpPct = unit.currentHealth / (unit.stats[1] || 1);
-          const barW = spriteSize - 4;
-          const barH = 3;
-          const barX = ux + 2;
-          const barY = uy + spriteSize - 1;
+          const hpPct = unit.currentHealth / (unit.maxHealth || 1);
           ctx.fillStyle = "#000";
-          ctx.fillRect(barX, barY, barW, barH);
+          ctx.fillRect(ux + 1, uy + spriteSize, spriteSize - 2, 3);
           ctx.fillStyle = hpPct > 0.5 ? "#22c55e" : hpPct > 0.25 ? "#eab308" : "#ef4444";
-          ctx.fillRect(barX, barY, barW * hpPct, barH);
+          ctx.fillRect(ux + 1, uy + spriteSize, (spriteSize - 2) * hpPct, 3);
         });
-
-        // Show count if more than 3
         if (tile.units.length > 3) {
           ctx.fillStyle = "#fbbf24";
-          ctx.font = "bold 10px system-ui";
+          ctx.font = "bold 9px system-ui";
           ctx.textAlign = "right";
-          ctx.fillText(`+${tile.units.length - 3}`, px + TILE_SIZE - 4, py + 14);
+          ctx.fillText(`+${tile.units.length - 3}`, px + TILE_SIZE - 3, py + 12);
         }
       }
     }
   }
+}
+
+// ─── Combat Panel Component ──────────────────────────────────
+
+function CombatPanel({
+  combat,
+  onNextRound,
+  onClose,
+}: {
+  combat: CombatState;
+  onNextRound: () => void;
+  onClose: () => void;
+}) {
+  const summary = getCombatSummary(combat);
+  const logEndRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    logEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [combat.log.length]);
+
+  return (
+    <div className="p-3 rounded-lg bg-gray-900/90 border border-red-900/40 backdrop-blur-sm">
+      <div className="flex items-center justify-between mb-2">
+        <h3 className="text-sm font-bold text-red-400">⚔️ Combat — {combat.tileName}</h3>
+        <div className="flex gap-2 items-center">
+          <span className="text-[10px] text-gray-500">Round {combat.round}</span>
+          {combat.result === "pending" ? (
+            <button
+              onClick={onNextRound}
+              className="px-2 py-1 text-xs bg-red-900/50 hover:bg-red-800/60 text-red-300 rounded border border-red-900/30 transition-colors"
+            >
+              {combat.isPaused ? "▶ Next Round" : "⚡ Auto-Round"}
+            </button>
+          ) : (
+            <button
+              onClick={onClose}
+              className="px-2 py-1 text-xs bg-gray-800 hover:bg-gray-700 text-gray-300 rounded border border-gray-700 transition-colors"
+            >
+              ✕ Close
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* HP Bars */}
+      <div className="grid grid-cols-2 gap-2 mb-2">
+        <div>
+          <div className="text-[10px] text-green-400 mb-0.5">Allies ({summary.allyAlive})</div>
+          <div className="w-full bg-gray-800 rounded-full h-2">
+            <div
+              className="h-full rounded-full bg-green-500 transition-all"
+              style={{ width: `${(summary.allyHP / Math.max(summary.allyMaxHP, 1)) * 100}%` }}
+            />
+          </div>
+          <div className="text-[9px] text-gray-500">{summary.allyHP}/{summary.allyMaxHP} HP</div>
+        </div>
+        <div>
+          <div className="text-[10px] text-red-400 mb-0.5">Enemies ({summary.enemyAlive})</div>
+          <div className="w-full bg-gray-800 rounded-full h-2">
+            <div
+              className="h-full rounded-full bg-red-500 transition-all"
+              style={{ width: `${(summary.enemyHP / Math.max(summary.enemyMaxHP, 1)) * 100}%` }}
+            />
+          </div>
+          <div className="text-[9px] text-gray-500">{summary.enemyHP}/{summary.enemyMaxHP} HP</div>
+        </div>
+      </div>
+
+      {/* Unit Cards */}
+      <div className="grid grid-cols-2 gap-1 mb-2">
+        {[...combat.allies.map((u) => ({ ...u, side: "ally" as const })),
+          ...combat.enemies.map((u) => ({ ...u, side: "enemy" as const }))].map((cu) => {
+          const hpPct = (cu.currentHealth / Math.max(cu.maxHealth, 1)) * 100;
+          return (
+            <div
+              key={cu.instance.id}
+              className={`p-1.5 rounded border text-[10px] flex items-center gap-1.5 ${
+                !cu.isAlive ? "opacity-30 " : ""
+              }${cu.side === "ally" ? "border-green-900/30 bg-green-950/10" : "border-red-900/30 bg-red-950/10"}`}
+            >
+              <div className="w-6 h-6 rounded overflow-hidden flex-shrink-0 bg-gray-800">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={getUnitImagePath(cu.instance.name)}
+                  alt=""
+                  className="w-full h-full object-cover"
+                  onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+                />
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex justify-between">
+                  <span className={`truncate ${cu.side === "ally" ? "text-green-300" : "text-red-300"}`}>
+                    {cu.instance.name}
+                  </span>
+                  <span className="text-gray-600 ml-1">{cu.isAlive ? "" : "☠️"}</span>
+                </div>
+                <div className="w-full bg-gray-800 rounded-full h-1 mt-0.5">
+                  <div
+                    className={`h-full rounded-full ${hpPct > 50 ? "bg-green-500" : hpPct > 25 ? "bg-yellow-500" : "bg-red-500"}`}
+                    style={{ width: `${hpPct}%` }}
+                  />
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Combat Log */}
+      <div className="max-h-32 overflow-y-auto text-[10px] font-mono space-y-px bg-black/30 rounded p-1.5">
+        {combat.log.slice(-30).map((entry, i) => (
+          <div
+            key={i}
+            className={
+              entry.type === "result"
+                ? entry.message.includes("Victory") ? "text-green-400 font-bold" : "text-red-400 font-bold"
+                : entry.type === "round" ? "text-gray-600 mt-0.5"
+                : entry.type === "death" ? "text-red-400"
+                : entry.type === "heal" ? "text-green-400"
+                : entry.type === "crit" ? "text-yellow-400"
+                : entry.type === "evade" ? "text-blue-400"
+                : entry.type === "counter" ? "text-purple-400"
+                : entry.type === "shield" ? "text-cyan-400"
+                : "text-gray-500"
+            }
+          >
+            {entry.message}
+          </div>
+        ))}
+        <div ref={logEndRef} />
+      </div>
+
+      {/* Result banner */}
+      {combat.result !== "pending" && (
+        <div className={`mt-2 p-2 rounded text-center font-bold text-sm ${
+          combat.result === "victory"
+            ? "bg-green-900/30 text-green-400 border border-green-900/40"
+            : "bg-red-900/30 text-red-400 border border-red-900/40"
+        }`}>
+          {combat.result === "victory" ? "🎉 VICTORY!" : "💀 DEFEAT"}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Upgrade Shop Component ──────────────────────────────────
+
+function UpgradeShop({
+  upgrades: ownedUpgrades,
+  resources,
+  onBuy,
+}: {
+  upgrades: Record<number, number>;
+  resources: { crystal: number; mana: number; matter: number; flesh: number };
+  onBuy: (id: number) => void;
+}) {
+  return (
+    <div className="p-3 rounded-lg bg-gray-900/80 border border-gray-800">
+      <h3 className="text-sm font-semibold text-gray-400 mb-2">🏪 Upgrades</h3>
+      <div className="space-y-1 max-h-52 overflow-y-auto">
+        {upgradeTypes.map((up) => {
+          const currentTier = ownedUpgrades[up.idKey] || 0;
+          const isMaxed = currentTier >= up.maxTier;
+          const canAfford =
+            resources.crystal >= up.costs.crystal &&
+            resources.mana >= up.costs.mana &&
+            resources.matter >= up.costs.matter &&
+            resources.flesh >= up.costs.flesh;
+          return (
+            <div key={up.idKey} className="flex items-center gap-2 p-1.5 rounded border border-gray-800/50 bg-gray-950/30">
+              <div className="w-7 h-7 rounded overflow-hidden bg-gray-800 flex-shrink-0">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={`/assets/upgrades/${up.icon}.png`}
+                  alt=""
+                  className="w-full h-full object-cover"
+                  onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+                />
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-1">
+                  <span className="text-xs text-white font-medium truncate">{up.name}</span>
+                  <span className="text-[9px] text-gray-600">{currentTier}/{up.maxTier}</span>
+                </div>
+                <p className="text-[9px] text-gray-500 truncate">{up.desc}</p>
+              </div>
+              {!isMaxed && (
+                <button
+                  disabled={!canAfford}
+                  onClick={() => onBuy(up.idKey)}
+                  className={`px-2 py-0.5 text-[9px] rounded border transition-colors flex-shrink-0 ${
+                    canAfford
+                      ? "bg-yellow-900/30 border-yellow-900/40 text-yellow-300 hover:bg-yellow-800/40"
+                      : "bg-gray-900 border-gray-800 text-gray-600 cursor-not-allowed"
+                  }`}
+                >
+                  {[up.costs.crystal && `${up.costs.crystal}💎`, up.costs.mana && `${up.costs.mana}🔮`,
+                    up.costs.matter && `${up.costs.matter}⚙️`, up.costs.flesh && `${up.costs.flesh}🩸`]
+                    .filter(Boolean).join(" ") || "Free"}
+                </button>
+              )}
+              {isMaxed && <span className="text-[9px] text-green-600">MAX</span>}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
 }
 
 // ─── Main Component ──────────────────────────────────────────
@@ -272,40 +595,25 @@ export default function GameView() {
   const [selectedTile, setSelectedTile] = useState<{ x: number; y: number } | null>(null);
   const [hoveredTile, setHoveredTile] = useState<{ x: number; y: number } | null>(null);
   const [dragTile, setDragTile] = useState<string | null>(null);
-  const [log, setLog] = useState<string[]>(["Welcome to Cursebound! Select a tile from your hand, then click on the map to place it."]);
-  const [combatLog, setCombatLog] = useState<string[]>([]);
-  const [showCombat, setShowCombat] = useState(false);
+  const [placingTorch, setPlacingTorch] = useState(false);
+  const [log, setLog] = useState<string[]>(["Welcome to Cursebound! Place tiles from your hand onto the map."]);
+  const [activeTab, setActiveTab] = useState<"info" | "upgrades" | "merges">("info");
   const [imagesReady, setImagesReady] = useState(false);
-  const [tileHand, setTileHand] = useState<string[]>(() => {
-    const hand: string[] = [];
-    for (let i = 0; i < 5; i++) {
-      hand.push(STARTING_TILES[Math.floor(Math.random() * STARTING_TILES.length)]);
-    }
-    return hand;
-  });
+  const [tileHand, setTileHand] = useState<string[]>(() =>
+    Array.from({ length: 5 }, () => STARTING_TILES[Math.floor(Math.random() * STARTING_TILES.length)])
+  );
 
   const addLog = useCallback((msg: string) => {
-    setLog((prev) => [...prev.slice(-50), msg]);
+    setLog((prev) => [...prev.slice(-60), msg]);
   }, []);
 
-  // Preload tile images
+  // Preload images
   useEffect(() => {
-    const tilesToLoad = tileTypes
-      .filter((t) => t.name !== "Blank")
-      .map((t) => getTileImagePath(t.name));
-    const unitsToLoad = unitTypes.map((u) => getUnitImagePath(u.name));
-    const all = [...tilesToLoad, ...unitsToLoad];
-
-    all.forEach((src) => getImage(src));
-
-    // Re-render once images load
+    tileTypes.filter((t) => t.name !== "Blank").forEach((t) => getImage(getTileImagePath(t.name)));
+    unitTypes.forEach((u) => getImage(getUnitImagePath(u.name)));
     const interval = setInterval(() => {
-      const loaded = Object.keys(imageCache).length;
-      if (loaded > 0) {
-        setImagesReady(true);
-      }
+      if (Object.keys(imageCache).length > 0) setImagesReady(true);
     }, 200);
-
     return () => clearInterval(interval);
   }, []);
 
@@ -315,13 +623,11 @@ export default function GameView() {
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-
     const totalSize = TILE_SIZE + TILE_GAP;
     canvas.width = CANVAS_PADDING * 2 + GRID_SIZE * totalSize;
     canvas.height = CANVAS_PADDING * 2 + GRID_SIZE * totalSize;
-
-    drawGrid(ctx, gameState, hoveredTile, selectedTile, dragTile);
-  }, [gameState, hoveredTile, selectedTile, dragTile, imagesReady]);
+    drawGrid(ctx, gameState, hoveredTile, selectedTile, dragTile, placingTorch);
+  }, [gameState, hoveredTile, selectedTile, dragTile, placingTorch, imagesReady]);
 
   // Mouse handlers
   const getTileCoords = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -344,18 +650,26 @@ export default function GameView() {
     if (!coords) return;
     const tile = gameState.map[coords.y][coords.x];
 
-    if (dragTile && tile.tileName === "Blank") {
+    // Torch placement
+    if (placingTorch && tile.tileName === "Blank" && tile.visibility >= TileVisibility.Discovered) {
+      placeTorch(coords.x, coords.y);
+      return;
+    }
+
+    // Tile placement
+    if (dragTile && tile.tileName === "Blank" && tile.visibility >= TileVisibility.Discovered) {
       placeTile(coords.x, coords.y, dragTile);
       return;
     }
 
+    // Selection
     if (selectedTile?.x === coords.x && selectedTile?.y === coords.y) {
       setSelectedTile(null);
-    } else {
+    } else if (tile.visibility >= TileVisibility.Discovered) {
       setSelectedTile(coords);
       if (tile.tileName !== "Blank") {
         const tileData = getTileByName(tile.tileName);
-        addLog(`Selected: ${tile.tileName} at (${coords.x}, ${coords.y}) — ${tile.units.length} units${tileData?.desc ? ` — ${tileData.desc}` : ""}`);
+        addLog(`Selected: ${tile.tileName} (${coords.x},${coords.y}) — ${tile.units.length} unit${tile.units.length !== 1 ? "s" : ""}${tileData?.desc ? ` — ${tileData.desc}` : ""}`);
       }
     }
   };
@@ -367,16 +681,12 @@ export default function GameView() {
   // ─── Game Logic ──────────────────────────────────────────
 
   const placeTile = (x: number, y: number, tileName: string) => {
-    // Check adjacency to road/camp
-    const adj = [
-      [x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1],
-    ];
-    const hasAdjacentNonBlank = adj.some(([ax, ay]) => {
+    const adj = [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]];
+    const hasAdj = adj.some(([ax, ay]) => {
       if (ax < 0 || ax >= GRID_SIZE || ay < 0 || ay >= GRID_SIZE) return false;
       return gameState.map[ay][ax].tileName !== "Blank";
     });
-
-    if (!hasAdjacentNonBlank) {
+    if (!hasAdj) {
       addLog("⚠️ Must place adjacent to an existing tile!");
       return;
     }
@@ -386,22 +696,31 @@ export default function GameView() {
       const tileData = getTileByName(tileName);
       next.map[y][x] = {
         tileTypeId: tileData?.idKey || 0, tileName, x, y, units: [],
+        visibility: TileVisibility.Filled,
+        isLightSource: false, lightRadius: 0,
       };
-
       next.cursePoints += curseData.settings.pointsPerTilePlaced;
 
-      // Check for merges
-      const adjacentSame = findAdjacentGroup(next.map, x, y, tileName);
-      if (adjacentSame.length >= 3) {
+      // Check merges
+      const group = findAdjacentGroup(next.map, x, y, tileName);
+      if (group.length >= 3) {
         const mergeOutput = getMergeOutput(tileName, tileName, tileName);
         if (mergeOutput) {
-          const toConsume = adjacentSame.slice(0, 3);
-          toConsume.forEach((pos, i) => {
+          const consume = group.slice(0, 3);
+          consume.forEach((pos, i) => {
             if (i < 2) {
-              next.map[pos.y][pos.x] = { tileTypeId: 0, tileName: "Blank", x: pos.x, y: pos.y, units: [] };
+              next.map[pos.y][pos.x] = {
+                tileTypeId: 0, tileName: "Blank", x: pos.x, y: pos.y, units: [],
+                visibility: TileVisibility.Discovered,
+                isLightSource: false, lightRadius: 0,
+              };
             } else {
               const outData = getTileByName(mergeOutput);
-              next.map[pos.y][pos.x] = { tileTypeId: outData?.idKey || 0, tileName: mergeOutput, x: pos.x, y: pos.y, units: [] };
+              next.map[pos.y][pos.x] = {
+                tileTypeId: outData?.idKey || 0, tileName: mergeOutput, x: pos.x, y: pos.y, units: [],
+                visibility: TileVisibility.Filled,
+                isLightSource: false, lightRadius: 0,
+              };
             }
           });
           addLog(`🔀 Merged 3× ${tileName} → ${mergeOutput}!`);
@@ -410,9 +729,25 @@ export default function GameView() {
         }
       }
 
+      // Spawn enemies on certain tiles
+      const enemySpawns: Record<string, number[]> = {
+        Ruins: [8], Dungeon: [10, 11], CultTemple: [5, 6], CultSanctum: [5],
+        CorruptedTree: [3], VoidSpawner: [10, 14], MeatPit: [15],
+      };
+      const possible = enemySpawns[tileName];
+      if (possible) {
+        const uid = possible[Math.floor(Math.random() * possible.length)];
+        const ut = getUnitByIdKey(uid);
+        if (ut) {
+          next.map[y][x].units.push(createUnitInstance(ut, true));
+          addLog(`⚠️ ${ut.name} appeared on ${tileName}!`);
+        }
+      }
+
       checkCurseLevel(next);
       next.resources.crystal += 1;
       next.resources.matter += 1;
+      computeVisibility(next.map);
       return next;
     });
 
@@ -427,6 +762,27 @@ export default function GameView() {
     });
     setDragTile(null);
     addLog(`Placed ${tileName} at (${x}, ${y})`);
+  };
+
+  const placeTorch = (x: number, y: number) => {
+    if (gameState.torchCount <= 0) {
+      addLog("⚠️ No torches available!");
+      return;
+    }
+
+    setGameState((prev) => {
+      const next = JSON.parse(JSON.stringify(prev)) as GameState;
+      next.map[y][x] = {
+        tileTypeId: 0, tileName: "Lantern", x, y, units: [],
+        visibility: TileVisibility.Active,
+        isLightSource: true, lightRadius: TORCH_LIGHT_RADIUS,
+      };
+      next.torchCount--;
+      computeVisibility(next.map);
+      return next;
+    });
+    setPlacingTorch(false);
+    addLog(`🔥 Placed torch at (${x}, ${y}) — reveals nearby tiles!`);
   };
 
   const findAdjacentGroup = (
@@ -449,26 +805,39 @@ export default function GameView() {
   };
 
   const checkCurseLevel = (state: GameState) => {
-    const nextLevel = curseData.levels[state.curseLevel];
-    if (!nextLevel) return;
     const threshold = curseData.settings.basePointsNeeded * (state.curseLevel + 1);
     if (state.cursePoints >= threshold) {
       state.curseLevel++;
       state.cursePoints = 0;
-      addLog(`💀 Curse Level ${state.curseLevel}! Dark energy surges across the land...`);
+      addLog(`💀 Curse Level ${state.curseLevel}! Dark energy surges...`);
 
-      // Spawn corrupted tiles
+      // Discover some fog and spawn corrupted tiles
+      const fogged: { x: number; y: number }[] = [];
       const blanks: { x: number; y: number }[] = [];
       state.map.forEach((row) => row.forEach((t) => {
-        if (t.tileName === "Blank") blanks.push({ x: t.x, y: t.y });
+        if (t.visibility === TileVisibility.Foggy) fogged.push({ x: t.x, y: t.y });
+        if (t.tileName === "Blank" && t.visibility >= TileVisibility.Discovered) blanks.push({ x: t.x, y: t.y });
       }));
+
+      // Reveal some fog
+      for (let i = 0; i < Math.min(state.curseLevel * 2, fogged.length); i++) {
+        const idx = Math.floor(Math.random() * fogged.length);
+        const pos = fogged.splice(idx, 1)[0];
+        state.map[pos.y][pos.x].visibility = TileVisibility.Discovered;
+      }
+
+      // Spawn cursed tiles
       const corruptTiles = ["CorruptedSeed", "MeatPit", "VoidSpawner"];
       for (let i = 0; i < Math.min(state.curseLevel, 3); i++) {
         if (blanks.length > 0) {
           const idx = Math.floor(Math.random() * blanks.length);
           const pos = blanks.splice(idx, 1)[0];
           const ct = corruptTiles[Math.floor(Math.random() * corruptTiles.length)];
-          state.map[pos.y][pos.x] = { tileTypeId: 0, tileName: ct, x: pos.x, y: pos.y, units: [] };
+          state.map[pos.y][pos.x] = {
+            tileTypeId: 0, tileName: ct, x: pos.x, y: pos.y, units: [],
+            visibility: state.map[pos.y][pos.x].visibility,
+            isLightSource: false, lightRadius: 0,
+          };
           addLog(`  ☠️ ${ct} appeared at (${pos.x}, ${pos.y})!`);
         }
       }
@@ -481,16 +850,16 @@ export default function GameView() {
       next.day++;
       next.cursePoints += curseData.settings.pointsPerDay;
 
-      // Spawn enemies on enemy tiles
+      // Enemies spawn on enemy tiles
       next.map.forEach((row) =>
         row.forEach((tile) => {
-          const enemyMap: Record<string, number[]> = {
-            Ruins: [8], Dungeon: [10, 11], CultTemple: [5, 6], CultSanctum: [5],
+          const spawns: Record<string, number[]> = {
+            Ruins: [8], Dungeon: [10, 11], CultTemple: [5, 6],
             CorruptedTree: [3], VoidSpawner: [10],
           };
-          const possibleUnits = enemyMap[tile.tileName];
-          if (possibleUnits && tile.units.filter((u) => u.isEnemy).length < 3) {
-            const uid = possibleUnits[Math.floor(Math.random() * possibleUnits.length)];
+          const possible = spawns[tile.tileName];
+          if (possible && tile.units.filter((u) => u.isEnemy).length < 3) {
+            const uid = possible[Math.floor(Math.random() * possible.length)];
             const ut = getUnitByIdKey(uid);
             if (ut) tile.units.push(createUnitInstance(ut, true));
           }
@@ -499,146 +868,193 @@ export default function GameView() {
 
       next.resources.flesh += 2;
       next.resources.mana += 1;
+      next.torchCount += 1; // earn a torch each day
       checkCurseLevel(next);
+      computeVisibility(next.map);
       return next;
     });
-    addLog(`🌅 Day ${gameState.day + 1} dawns. The curse grows stronger...`);
+    addLog(`🌅 Day ${gameState.day + 1} dawns. +1 🔥 torch. The curse grows...`);
   };
 
   const startCombat = () => {
-    if (!selectedTile) { addLog("Select a tile with enemies to start combat!"); return; }
+    if (gameState.combat?.active) { addLog("Combat already in progress!"); return; }
+    if (!selectedTile) { addLog("Select a tile with enemies first!"); return; }
     const tile = gameState.map[selectedTile.y][selectedTile.x];
     const enemies = tile.units.filter((u) => u.isEnemy);
     if (enemies.length === 0) { addLog("No enemies on this tile!"); return; }
 
+    // Gather allies from camp and adjacent tiles
     const allies = gameState.map.flat().flatMap((t) => t.units.filter((u) => !u.isEnemy));
     if (allies.length === 0) { addLog("No allies to fight!"); return; }
 
-    const clog: string[] = [`⚔️ Combat on ${tile.tileName}!`];
-    const allyHP = allies.map((a) => ({ ...a, currentHealth: a.stats[1] || a.currentHealth }));
-    const enemyHP = enemies.map((e) => ({ ...e, currentHealth: e.stats[1] || e.currentHealth }));
+    setGameState((prev) => {
+      const next = JSON.parse(JSON.stringify(prev)) as GameState;
+      next.combat = initCombat(allies, enemies, tile.tileName, selectedTile.x, selectedTile.y);
+      return next;
+    });
+    addLog(`⚔️ Combat started on ${tile.tileName}!`);
+  };
 
-    let round = 0;
-    while (allyHP.some((a) => a.currentHealth > 0) && enemyHP.some((e) => e.currentHealth > 0) && round < 20) {
-      round++;
-      clog.push(`--- Round ${round} ---`);
-      allyHP.filter((a) => a.currentHealth > 0).forEach((ally) => {
-        const target = enemyHP.find((e) => e.currentHealth > 0);
-        if (!target) return;
-        const dmg = Math.floor(Math.random() * ((ally.stats[4] || 5) - (ally.stats[3] || 2) + 1) + (ally.stats[3] || 2));
-        const def = target.stats[9] || 0;
-        const actual = Math.max(1, dmg - def);
-        target.currentHealth -= actual;
-        clog.push(`  ${ally.name} → ${target.name} for ${actual} dmg (${Math.max(0, target.currentHealth)} HP)`);
-      });
-      enemyHP.filter((e) => e.currentHealth > 0).forEach((enemy) => {
-        const target = allyHP.find((a) => a.currentHealth > 0);
-        if (!target) return;
-        const dmg = Math.floor(Math.random() * ((enemy.stats[4] || 5) - (enemy.stats[3] || 2) + 1) + (enemy.stats[3] || 2));
-        const def = target.stats[9] || 0;
-        const actual = Math.max(1, dmg - def);
-        target.currentHealth -= actual;
-        clog.push(`  ${enemy.name} → ${target.name} for ${actual} dmg (${Math.max(0, target.currentHealth)} HP)`);
-      });
-    }
+  const advanceCombat = () => {
+    setGameState((prev) => {
+      if (!prev.combat || !prev.combat.active) return prev;
+      const next = JSON.parse(JSON.stringify(prev)) as GameState;
+      next.combat = simulateRound(next.combat!);
 
-    const won = allyHP.some((a) => a.currentHealth > 0);
-    clog.push(won ? "🎉 Victory!" : "💀 Defeat!");
+      // On victory: remove enemies from tile, gain rewards
+      if (next.combat!.result === "victory") {
+        const tx = next.combat!.tileX;
+        const ty = next.combat!.tileY;
+        const killed = next.map[ty][tx].units.filter((u: UnitInstance) => u.isEnemy).length;
+        next.map[ty][tx].units = next.map[ty][tx].units.filter((u: UnitInstance) => !u.isEnemy);
+        next.cursePoints += curseData.settings.pointsPerKill * killed;
+        next.resources.crystal += killed;
+        next.resources.flesh += killed;
+        next.torchCount += 1; // earn torch from combat
+        addLog(`Victory! +${killed} 💎 +${killed} 🩸 +1 🔥`);
 
-    if (won) {
-      setGameState((prev) => {
-        const next = JSON.parse(JSON.stringify(prev)) as GameState;
-        next.map[selectedTile.y][selectedTile.x].units = next.map[selectedTile.y][selectedTile.x].units.filter((u) => !u.isEnemy);
-        next.cursePoints += curseData.settings.pointsPerKill * enemies.length;
-        next.resources.crystal += enemies.length;
-        next.resources.flesh += enemies.length;
-        checkCurseLevel(next);
-        return next;
-      });
-      addLog(`Victory! Gained ${enemies.length} crystal & flesh.`);
-    }
-    setCombatLog(clog);
-    setShowCombat(true);
+        // Update ally HP from combat results
+        for (const cu of next.combat!.allies) {
+          for (const row of next.map) {
+            for (const tile of row) {
+              const unit = tile.units.find((u: UnitInstance) => u.id === cu.instance.id);
+              if (unit) {
+                unit.currentHealth = Math.max(0, cu.currentHealth);
+              }
+            }
+          }
+        }
+      }
+      if (next.combat!.result === "defeat") {
+        addLog("Defeat... Your allies have fallen.");
+      }
+      return next;
+    });
+  };
+
+  const closeCombat = () => {
+    setGameState((prev) => {
+      const next = JSON.parse(JSON.stringify(prev)) as GameState;
+      next.combat = null;
+      return next;
+    });
+  };
+
+  const buyUpgrade = (id: number) => {
+    const up = upgradeTypes.find((u) => u.idKey === id);
+    if (!up) return;
+
+    setGameState((prev) => {
+      const currentTier = prev.upgrades[id] || 0;
+      if (currentTier >= up.maxTier) return prev;
+      if (
+        prev.resources.crystal < up.costs.crystal ||
+        prev.resources.mana < up.costs.mana ||
+        prev.resources.matter < up.costs.matter ||
+        prev.resources.flesh < up.costs.flesh
+      ) return prev;
+
+      const next = JSON.parse(JSON.stringify(prev)) as GameState;
+      next.resources.crystal -= up.costs.crystal;
+      next.resources.mana -= up.costs.mana;
+      next.resources.matter -= up.costs.matter;
+      next.resources.flesh -= up.costs.flesh;
+      next.upgrades[id] = currentTier + 1;
+      return next;
+    });
+    addLog(`🏪 Upgraded ${up.name} to tier ${(gameState.upgrades[id] || 0) + 1}!`);
   };
 
   // ─── Render ──────────────────────────────────────────────
 
   const curseMax = curseData.settings.basePointsNeeded * (gameState.curseLevel + 1);
   const cursePct = Math.min((gameState.cursePoints / curseMax) * 100, 100);
+  const canvasTotal = CANVAS_PADDING * 2 + GRID_SIZE * (TILE_SIZE + TILE_GAP);
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-3">
       {/* Status Bar */}
-      <div className="flex flex-wrap gap-4 items-center p-3 rounded-lg bg-gray-900/80 border border-gray-800 backdrop-blur-sm">
+      <div className="flex flex-wrap gap-3 items-center p-2.5 rounded-lg bg-gray-900/80 border border-gray-800 backdrop-blur-sm">
         <div className="text-sm">
           <span className="text-gray-500">Day</span>{" "}
           <span className="font-bold text-white text-lg">{gameState.day}</span>
         </div>
-        <div className="h-6 w-px bg-gray-700" />
-        <div className="flex items-center gap-2 text-sm">
+        <div className="h-5 w-px bg-gray-700" />
+        <div className="flex items-center gap-1.5 text-sm">
           <span className="text-gray-500">Curse</span>
           <span className="font-bold text-red-400">Lv{gameState.curseLevel}</span>
-          <div className="w-28 bg-gray-800 rounded-full h-2.5 overflow-hidden">
-            <div
-              className="h-full rounded-full bg-gradient-to-r from-red-800 to-red-400 transition-all duration-300"
-              style={{ width: `${cursePct}%` }}
-            />
+          <div className="w-20 bg-gray-800 rounded-full h-2 overflow-hidden">
+            <div className="h-full rounded-full bg-gradient-to-r from-red-800 to-red-400 transition-all duration-300"
+              style={{ width: `${cursePct}%` }} />
           </div>
-          <span className="text-[10px] text-gray-600">{gameState.cursePoints}/{curseMax}</span>
+          <span className="text-[9px] text-gray-600">{gameState.cursePoints}/{curseMax}</span>
         </div>
-        <div className="h-6 w-px bg-gray-700" />
-        <div className="flex gap-3 text-sm">
-          {RESOURCE_NAMES.map((r) => (
-            <span key={r} className="flex items-center gap-1">
-              <span>{RESOURCE_EMOJI[r]}</span>
-              <span className="font-mono text-white">{gameState.resources[r]}</span>
+        <div className="h-5 w-px bg-gray-700" />
+        <div className="flex gap-2 text-sm">
+          {(["crystal", "mana", "matter", "flesh"] as const).map((r) => (
+            <span key={r} className="flex items-center gap-0.5">
+              <span className="text-xs">{RESOURCE_EMOJI[r]}</span>
+              <span className="font-mono text-white text-xs">{gameState.resources[r]}</span>
             </span>
           ))}
         </div>
-        <div className="ml-auto flex gap-2">
-          <button onClick={startCombat} className="px-3 py-1.5 rounded-md bg-red-900/50 hover:bg-red-800/60 text-red-300 text-xs font-medium transition-colors border border-red-900/30">
+        <div className="h-5 w-px bg-gray-700" />
+        <span className="text-xs text-yellow-400">🔥 {gameState.torchCount}</span>
+        <div className="ml-auto flex gap-1.5">
+          <button
+            onClick={() => { setPlacingTorch(!placingTorch); setDragTile(null); }}
+            disabled={gameState.torchCount <= 0}
+            className={`px-2 py-1 rounded text-xs font-medium transition-colors border ${
+              placingTorch
+                ? "bg-yellow-800/50 border-yellow-700 text-yellow-200"
+                : gameState.torchCount > 0
+                  ? "bg-yellow-900/30 border-yellow-900/30 text-yellow-400 hover:bg-yellow-800/40"
+                  : "bg-gray-900 border-gray-800 text-gray-600 cursor-not-allowed"
+            }`}
+          >
+            🔥 Torch
+          </button>
+          <button onClick={startCombat} className="px-2 py-1 rounded bg-red-900/40 hover:bg-red-800/50 text-red-300 text-xs font-medium transition-colors border border-red-900/30">
             ⚔️ Fight
           </button>
-          <button onClick={endDay} className="px-3 py-1.5 rounded-md bg-purple-900/50 hover:bg-purple-800/60 text-purple-300 text-xs font-medium transition-colors border border-purple-900/30">
+          <button onClick={endDay} className="px-2 py-1 rounded bg-purple-900/40 hover:bg-purple-800/50 text-purple-300 text-xs font-medium transition-colors border border-purple-900/30">
             🌅 End Day
           </button>
           <button onClick={() => {
             setGameState(createInitialState());
             setTileHand(Array.from({ length: 5 }, () => STARTING_TILES[Math.floor(Math.random() * STARTING_TILES.length)]));
-            setLog(["Game reset. Welcome to Cursebound!"]);
-            setCombatLog([]); setShowCombat(false); setSelectedTile(null);
-          }} className="px-3 py-1.5 rounded-md bg-gray-800 hover:bg-gray-700 text-gray-400 text-xs font-medium transition-colors border border-gray-700/50">
+            setLog(["Game reset."]); setSelectedTile(null); setDragTile(null); setPlacingTorch(false);
+          }} className="px-2 py-1 rounded bg-gray-800 hover:bg-gray-700 text-gray-400 text-xs border border-gray-700/50">
             🔄
           </button>
         </div>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-[auto_1fr] gap-4">
-        {/* Game Canvas + Hand */}
-        <div className="space-y-3">
+      <div className="grid grid-cols-1 lg:grid-cols-[auto_320px] gap-3">
+        {/* Map + Hand */}
+        <div className="space-y-2">
           <canvas
             ref={canvasRef}
             className="rounded-lg border border-gray-800 cursor-pointer shadow-xl shadow-black/40"
-            style={{
-              width: CANVAS_PADDING * 2 + GRID_SIZE * (TILE_SIZE + TILE_GAP),
-              height: CANVAS_PADDING * 2 + GRID_SIZE * (TILE_SIZE + TILE_GAP),
-            }}
+            style={{ width: canvasTotal, height: canvasTotal }}
             onClick={handleCanvasClick}
             onMouseMove={handleCanvasMove}
             onMouseLeave={() => setHoveredTile(null)}
           />
 
           {/* Tile Hand */}
-          <div className="p-3 rounded-lg bg-gray-900/80 border border-gray-800">
-            <div className="text-xs text-gray-500 mb-2">Your Hand — click a tile, then click blank space on the map</div>
-            <div className="flex gap-2 flex-wrap">
+          <div className="p-2.5 rounded-lg bg-gray-900/80 border border-gray-800">
+            <div className="text-[10px] text-gray-500 mb-1.5">
+              {placingTorch ? "🔥 Click a discovered blank tile to place torch" : "Click a tile, then click the map to place it"}
+            </div>
+            <div className="flex gap-1.5 flex-wrap">
               {tileHand.map((tile, i) => {
-                const isActive = dragTile === tile;
+                const isActive = dragTile === tile && !placingTorch;
                 return (
                   <button
                     key={`${tile}-${i}`}
-                    onClick={() => setDragTile(isActive ? null : tile)}
-                    className={`w-[72px] h-[72px] rounded-lg border-2 transition-all relative overflow-hidden ${
+                    onClick={() => { setDragTile(isActive ? null : tile); setPlacingTorch(false); }}
+                    className={`w-[60px] h-[60px] rounded-lg border-2 transition-all relative overflow-hidden ${
                       isActive
                         ? "border-yellow-400 scale-110 shadow-lg shadow-yellow-400/30 z-10"
                         : "border-gray-700 hover:border-gray-500 hover:scale-105"
@@ -646,13 +1062,10 @@ export default function GameView() {
                     style={{ backgroundColor: tileColors[tile] || "#333" }}
                   >
                     {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img
-                      src={getTileImagePath(tile)}
-                      alt={tile}
+                    <img src={getTileImagePath(tile)} alt={tile}
                       className="absolute inset-0 w-full h-full object-cover"
-                      onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
-                    />
-                    <span className="absolute bottom-0 inset-x-0 bg-black/60 text-white text-[9px] font-bold py-0.5 text-center">
+                      onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }} />
+                    <span className="absolute bottom-0 inset-x-0 bg-black/60 text-white text-[8px] font-bold py-0.5 text-center">
                       {tile}
                     </span>
                   </button>
@@ -660,13 +1073,51 @@ export default function GameView() {
               })}
             </div>
           </div>
+
+          {/* Game Log */}
+          <div className="p-2.5 rounded-lg bg-gray-900/80 border border-gray-800">
+            <h3 className="text-xs font-semibold text-gray-500 mb-1">📜 Log</h3>
+            <div className="max-h-28 overflow-y-auto text-[10px] font-mono space-y-px">
+              {log.slice().reverse().map((line, i) => (
+                <div key={i} className={
+                  line.includes("💀") ? "text-red-400" : line.includes("🔀") ? "text-blue-400" :
+                  line.includes("⚠️") ? "text-yellow-400" : line.includes("🌅") ? "text-purple-400" :
+                  line.includes("Victory") ? "text-green-400" : line.includes("🔥") ? "text-yellow-300" : "text-gray-500"
+                }>{line}</div>
+              ))}
+            </div>
+          </div>
         </div>
 
-        {/* Info Panel */}
-        <div className="space-y-3">
-          {/* Selected Tile Info */}
-          {selectedTile && (() => {
+        {/* Right Panel */}
+        <div className="space-y-2">
+          {/* Combat Panel */}
+          {gameState.combat && (
+            <CombatPanel
+              combat={gameState.combat}
+              onNextRound={advanceCombat}
+              onClose={closeCombat}
+            />
+          )}
+
+          {/* Tab selector */}
+          <div className="flex gap-1 text-[10px]">
+            {[
+              { key: "info" as const, label: "📋 Info" },
+              { key: "upgrades" as const, label: "🏪 Upgrades" },
+              { key: "merges" as const, label: "🔀 Merges" },
+            ].map((tab) => (
+              <button key={tab.key} onClick={() => setActiveTab(tab.key)}
+                className={`px-2 py-1 rounded transition-colors ${
+                  activeTab === tab.key ? "bg-gray-700 text-white" : "bg-gray-900 text-gray-500 hover:text-gray-400"
+                }`}>{tab.label}</button>
+            ))}
+          </div>
+
+          {/* Tab Content */}
+          {activeTab === "info" && selectedTile && (() => {
             const tile = gameState.map[selectedTile.y][selectedTile.x];
+            if (tile.visibility < TileVisibility.Discovered) return <div className="p-3 rounded-lg bg-gray-900/80 border border-gray-800 text-xs text-gray-600">Fog of war — tile not yet discovered</div>;
             const tileData = getTileByName(tile.tileName);
             return (
               <div className="p-3 rounded-lg bg-gray-900/80 border border-gray-800">
@@ -678,18 +1129,24 @@ export default function GameView() {
                   </div>
                   <div>
                     <h3 className="text-sm font-semibold text-white">{tile.tileName}</h3>
-                    <p className="text-[10px] text-gray-500">({selectedTile.x}, {selectedTile.y}){tileData?.desc ? ` — ${tileData.desc}` : ""}</p>
+                    <p className="text-[9px] text-gray-500">
+                      ({selectedTile.x},{selectedTile.y})
+                      {tile.isLightSource && " 💡 Light source"}
+                      {tile.visibility === TileVisibility.Active ? " ✨ Active" : tile.visibility === TileVisibility.Discovered ? " 👁️ Dim" : ""}
+                    </p>
+                    {tileData?.desc && <p className="text-[9px] text-gray-600 mt-0.5">{tileData.desc}</p>}
                   </div>
                 </div>
                 {tile.units.length > 0 ? (
-                  <div className="space-y-1.5">
+                  <div className="space-y-1">
                     {tile.units.map((unit) => {
-                      const hpPct = (unit.currentHealth / (unit.stats[1] || 1)) * 100;
+                      const hpPct = (unit.currentHealth / (unit.maxHealth || 1)) * 100;
+                      const ut = getUnitByIdKey(unit.unitTypeId);
                       return (
-                        <div key={unit.id} className={`p-2 rounded border text-xs flex items-center gap-2 ${
-                          unit.isEnemy ? "border-red-900/40 bg-red-950/20" : "border-green-900/40 bg-green-950/20"
+                        <div key={unit.id} className={`p-1.5 rounded border text-[10px] flex items-center gap-1.5 ${
+                          unit.isEnemy ? "border-red-900/30 bg-red-950/10" : "border-green-900/30 bg-green-950/10"
                         }`}>
-                          <div className="w-8 h-8 rounded overflow-hidden flex-shrink-0 bg-gray-800">
+                          <div className="w-7 h-7 rounded overflow-hidden flex-shrink-0 bg-gray-800">
                             {/* eslint-disable-next-line @next/next/no-img-element */}
                             <img src={getPortraitPath(unit.name)} alt="" className="w-full h-full object-cover"
                               onError={(e) => {
@@ -703,85 +1160,70 @@ export default function GameView() {
                               <span className={unit.isEnemy ? "text-red-300" : "text-green-300"}>
                                 {unit.isEnemy ? "☠️" : "🛡️"} {unit.name}
                               </span>
-                              <span className="text-gray-500">Lv.{unit.level}</span>
+                              <span className="text-gray-600">Lv.{unit.level}</span>
                             </div>
-                            <div className="w-full bg-gray-800 rounded-full h-1.5 mt-1">
-                              <div className={`h-full rounded-full transition-all ${hpPct > 50 ? "bg-green-500" : hpPct > 25 ? "bg-yellow-500" : "bg-red-500"}`}
+                            <div className="w-full bg-gray-800 rounded-full h-1 mt-0.5">
+                              <div className={`h-full rounded-full ${hpPct > 50 ? "bg-green-500" : hpPct > 25 ? "bg-yellow-500" : "bg-red-500"}`}
                                 style={{ width: `${hpPct}%` }} />
                             </div>
-                            <div className="text-gray-500 mt-0.5">
-                              HP {unit.currentHealth}/{unit.stats[1]} | DMG {unit.stats[3]}-{unit.stats[4]} | DEF {unit.stats[9] || 0}
+                            <div className="text-gray-600 mt-0.5">
+                              HP {unit.currentHealth}/{unit.maxHealth} | DMG {ut?.minDam ?? "?"}-{ut?.maxDam ?? "?"} | DEF {ut?.defense ?? 0} | SPD {ut?.attackSpeed ?? "?"}ms
+                              {(ut?.critChance ?? 0) > 0 && ` | CRIT ${ut?.critChance}%`}
+                              {(ut?.healing ?? 0) > 0 && ` | HEAL ${ut?.healing}`}
+                              {(ut?.taunt ?? 0) > 0 && ` | TAUNT ${ut?.taunt}%`}
                             </div>
                           </div>
                         </div>
                       );
                     })}
                   </div>
-                ) : <p className="text-xs text-gray-600">No units</p>}
+                ) : <p className="text-[10px] text-gray-600">No units on this tile</p>}
               </div>
             );
           })()}
 
-          {/* Combat Log */}
-          {showCombat && (
-            <div className="p-3 rounded-lg bg-gray-900/80 border border-red-900/30">
-              <div className="flex justify-between items-center mb-2">
-                <h3 className="text-sm font-semibold text-red-400">⚔️ Combat Log</h3>
-                <button onClick={() => setShowCombat(false)} className="text-xs text-gray-500 hover:text-gray-300">✕</button>
-              </div>
-              <div className="max-h-48 overflow-y-auto text-xs font-mono space-y-0.5">
-                {combatLog.map((line, i) => (
-                  <div key={i} className={
-                    line.includes("Victory") ? "text-green-400 font-bold" :
-                    line.includes("Defeat") ? "text-red-400 font-bold" :
-                    line.startsWith("---") ? "text-gray-600 mt-1" : "text-gray-400"
-                  }>{line}</div>
+          {activeTab === "info" && !selectedTile && (
+            <div className="p-3 rounded-lg bg-gray-900/80 border border-gray-800 text-xs text-gray-600">
+              Click a tile on the map to see details
+            </div>
+          )}
+
+          {activeTab === "upgrades" && (
+            <UpgradeShop
+              upgrades={gameState.upgrades}
+              resources={gameState.resources}
+              onBuy={buyUpgrade}
+            />
+          )}
+
+          {activeTab === "merges" && (
+            <div className="p-3 rounded-lg bg-gray-900/80 border border-gray-800">
+              <h3 className="text-sm font-semibold text-gray-400 mb-2">🔀 Merge Recipes</h3>
+              <p className="text-[9px] text-gray-600 mb-2">Place 3 of the same tile adjacent → they merge into a stronger tile!</p>
+              <div className="grid grid-cols-1 gap-0.5 text-[10px] max-h-52 overflow-y-auto">
+                {mergeTypes.filter((m) => m.firstTileTypeId !== "0").map((m, i) => (
+                  <div key={i} className="flex items-center gap-1 text-gray-500">
+                    <span className="w-2 h-2 rounded-sm" style={{ backgroundColor: tileColors[m.firstTileTypeId] || "#555" }} />
+                    <span>{m.firstTileTypeId}</span>
+                    <span className="text-gray-700">×3 →</span>
+                    <span className="w-2 h-2 rounded-sm" style={{ backgroundColor: tileColors[m.outputTileTypeId] || "#555" }} />
+                    <span className="text-white font-medium">{m.outputTileTypeId}</span>
+                  </div>
                 ))}
               </div>
             </div>
           )}
 
-          {/* Game Log */}
-          <div className="p-3 rounded-lg bg-gray-900/80 border border-gray-800">
-            <h3 className="text-sm font-semibold text-gray-400 mb-2">📜 Game Log</h3>
-            <div className="max-h-48 overflow-y-auto text-xs font-mono space-y-0.5">
-              {log.slice().reverse().map((line, i) => (
-                <div key={i} className={
-                  line.includes("💀") ? "text-red-400" :
-                  line.includes("🔀") ? "text-blue-400" :
-                  line.includes("⚠️") ? "text-yellow-400" :
-                  line.includes("🌅") ? "text-purple-400" : "text-gray-500"
-                }>{line}</div>
-              ))}
-            </div>
-          </div>
-
           {/* Mana Types */}
-          <div className="p-3 rounded-lg bg-gray-900/80 border border-gray-800">
-            <h3 className="text-sm font-semibold text-gray-400 mb-2">🔮 Mana Types</h3>
-            <div className="flex flex-wrap gap-2">
+          <div className="p-2.5 rounded-lg bg-gray-900/80 border border-gray-800">
+            <h3 className="text-[10px] font-semibold text-gray-500 mb-1.5">🔮 Mana Types</h3>
+            <div className="flex flex-wrap gap-1.5">
               {manaTypes.map((m) => (
-                <span key={m.idKey} className="px-2 py-1 rounded text-xs border border-gray-700 flex items-center gap-1.5"
-                  style={{ borderColor: m.color + "60", backgroundColor: m.color + "15" }}>
-                  <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: m.color }} />
+                <span key={m.idKey} className="px-1.5 py-0.5 rounded text-[9px] border border-gray-700 flex items-center gap-1"
+                  style={{ borderColor: m.color + "40", backgroundColor: m.color + "10" }}>
+                  <span className="w-2 h-2 rounded-full" style={{ backgroundColor: m.color }} />
                   <span style={{ color: m.color }}>{m.name}</span>
                 </span>
-              ))}
-            </div>
-          </div>
-
-          {/* Merge Reference */}
-          <div className="p-3 rounded-lg bg-gray-900/80 border border-gray-800">
-            <h3 className="text-sm font-semibold text-gray-400 mb-2">🔀 Merges</h3>
-            <div className="grid grid-cols-1 gap-1 text-xs max-h-40 overflow-y-auto">
-              {mergeTypes.map((m) => (
-                <div key={m.id} className="flex items-center gap-1 text-gray-500">
-                  <span className="w-2.5 h-2.5 rounded-sm" style={{ backgroundColor: tileColors[m.firstTileTypeId] || "#555" }} />
-                  <span>{m.firstTileTypeId}</span>
-                  <span className="text-gray-700">×3 →</span>
-                  <span className="w-2.5 h-2.5 rounded-sm" style={{ backgroundColor: tileColors[m.outputTileTypeId] || "#555" }} />
-                  <span className="text-white font-medium">{m.outputTileTypeId}</span>
-                </div>
               ))}
             </div>
           </div>
