@@ -27,33 +27,33 @@ export interface MapObject extends IMapObject {
 // ─── Effects / Traits System ─────────────────────────────────
 
 export interface IEffect {
-  entityTypeId: number;
-  entityId: number;
+  entityTypeId: string | number;
+  entityId: string | number;
   minQuantity: number;
   maxQuantity: number;
-  chance: number;
-  groupId: number;
-  requiredEntityTypeId: number;
-  requiredEntityId: number;
-  requiredQuantity: number;
+  chance: number | string;
+  groupId?: number;
+  requiredEntityTypeId?: number;
+  requiredEntityId?: number;
+  requiredQuantity?: number;
 }
 
 export interface Effect extends IEffect {
   index: number;
-  name: string;
+  name?: string;
   triggerTypeId: string;
-  entityTypeId: number;
-  entityId: number;
+  entityTypeId: string | number;
+  entityId: string | number;
   minQuantity: number;
   maxQuantity: number;
-  chance: number;
-  groupId: number;
-  maxTriggerTimes: number;
-  minTriggerTimes: number;
-  requiredEntityTypeId: number;
-  requiredEntityId: number;
-  requiredQuantity: number;
-  triggerEveryNTimes: number;
+  chance: number | string;
+  groupId?: number;
+  maxTriggerTimes?: number;
+  minTriggerTimes?: number;
+  requiredEntityTypeId?: number;
+  requiredEntityId?: number;
+  requiredQuantity?: number;
+  triggerEveryNTimes?: number;
 }
 
 export interface UpgradeEffect extends Effect {

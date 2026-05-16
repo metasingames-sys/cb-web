@@ -50,7 +50,7 @@ function UnitCard({ unit }: { unit: UnitType }) {
         {unit.critChance > 0 && <span>Crit: {unit.critChance}%</span>}
         {unit.healing > 0 && <span>Heal: {unit.healing}</span>}
         {unit.leadership > 0 && <span>Lead: {unit.leadership}</span>}
-        {unit.combatRow > 0 && <span>Row: {unit.combatRow}</span>}
+        {unit.combatRow && unit.combatRow !== "0" && <span>Row: {unit.combatRow}</span>}
         {unit.attackFX && <span>FX: {unit.attackFX}</span>}
         {unit.maxQuantityOnMap > 0 && <span>Max: {unit.maxQuantityOnMap}</span>}
       </div>
@@ -137,7 +137,7 @@ function UpgradeTree() {
           .filter(p => p > 0)
           .map(p => upgradeTypes.find(u => u.idKey === p)?.name || `#${p}`);
         return (
-          <div key={upgrade.id} className="rounded-lg border border-gray-700 bg-gray-900/80 p-4 hover:bg-gray-900 transition-colors">
+          <div key={upgrade.idKey} className="rounded-lg border border-gray-700 bg-gray-900/80 p-4 hover:bg-gray-900 transition-colors">
             <div className="flex items-start justify-between mb-2">
               <h3 className="font-semibold text-white">{upgrade.name}</h3>
               <span className="text-xs bg-purple-900/50 text-purple-300 px-1.5 py-0.5 rounded">
